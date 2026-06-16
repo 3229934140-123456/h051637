@@ -49,6 +49,7 @@ function createEmptyRenewalTask(domain: string): RenewalTask {
     consecutiveFailures: 0,
     failureHistory: [],
     successHistory: [],
+    phaseTimeline: [],
   };
 }
 
@@ -157,6 +158,13 @@ export class RenewalScheduler {
                 (h: any) => ({
                   ...h,
                   timestamp: new Date(h.timestamp),
+                })
+              ),
+              phaseTimeline: (taskData.phaseTimeline || []).map(
+                (t: any) => ({
+                  ...t,
+                  startedAt: new Date(t.startedAt),
+                  endedAt: t.endedAt ? new Date(t.endedAt) : undefined,
                 })
               ),
             };
@@ -301,6 +309,7 @@ export class RenewalScheduler {
       lastAttemptAt: new Date(),
       currentPhase: 'ordering',
       phaseDetail: 'Creating ACME order',
+      phaseTimeline: existingTask.phaseTimeline.slice(-30),
     };
 
     this.tasks.set(domain, task);
@@ -315,16 +324,14 @@ export class RenewalScheduler {
 
     try {
       if (this.policy.onBeforeRenewal) {
-        task.currentPhase = 'checking';
-        task.phaseDetail = 'Running onBeforeRenewal hook';
-        this.tasks.set(domain, { ...task });
+        this.markPhaseStart(task, 'checking', 'Running onBeforeRenewal hook');
         this.saveTasksToDisk();
         await this.policy.onBeforeRenewal(cert);
+        this.markPhaseEnd(task, 'checking');
+        this.saveTasksToDisk();
       }
 
-      task.currentPhase = 'challenging';
-      task.phaseDetail = `Setting up ${effectiveChallengeType} challenge`;
-      this.tasks.set(domain, { ...task });
+      this.markPhaseStart(task, 'challenging', `Setting up ${effectiveChallengeType} challenge`);
       this.saveTasksToDisk();
 
       const result = await this.acmeClient.issueCertificate(
@@ -359,9 +366,8 @@ export class RenewalScheduler {
         }
       );
 
-      task.currentPhase = 'finalizing';
-      task.phaseDetail = 'Finalizing order and downloading certificate';
-      this.tasks.set(domain, { ...task });
+      this.markPhaseEnd(task, 'challenging');
+      this.markPhaseStart(task, 'finalizing', 'Finalizing order and downloading certificate');
       this.saveTasksToDisk();
 
       for (const token of activeTokens) {
@@ -378,6 +384,8 @@ export class RenewalScheduler {
           );
         }
       }
+
+      this.markPhaseEnd(task, 'finalizing');
 
       const certInfo = this.certStore.parseCertificateInfo(result.certificate);
       const now = new Date();
@@ -399,9 +407,7 @@ export class RenewalScheduler {
         challengeType: effectiveChallengeType,
       };
 
-      task.currentPhase = 'installing';
-      task.phaseDetail = 'Installing new certificate';
-      this.tasks.set(domain, { ...task });
+      this.markPhaseStart(task, 'installing', 'Installing new certificate');
       this.saveTasksToDisk();
 
       await this.certStore.saveCertificate(newCert);
@@ -410,9 +416,8 @@ export class RenewalScheduler {
         await this.policy.onRenewalSuccess(cert, newCert);
       }
 
-      task.currentPhase = 'cleaning';
-      task.phaseDetail = 'Removing old certificate';
-      this.tasks.set(domain, { ...task });
+      this.markPhaseEnd(task, 'installing');
+      this.markPhaseStart(task, 'cleaning', 'Removing old certificate');
       this.saveTasksToDisk();
 
       await this.certStore.removeCertificate(cert.serialNumber);
@@ -449,6 +454,7 @@ export class RenewalScheduler {
 
       task.currentPhase = 'idle';
       task.phaseDetail = undefined;
+      this.markPhaseEnd(task, 'cleaning');
 
       console.log(
         `[RenewalScheduler] Successfully renewed ${domain} with ${effectiveChallengeType} (serial: ${newCert.serialNumber})`
@@ -469,6 +475,10 @@ export class RenewalScheduler {
             `[RenewalScheduler] Failed to cleanup challenge after error: ${(cleanupErr as Error).message}`
           );
         }
+      }
+
+      if (task.currentPhase && task.currentPhase !== 'idle') {
+        this.markPhaseEnd(task, task.currentPhase, error.message);
       }
 
       task.status = 'failed';
@@ -520,6 +530,39 @@ export class RenewalScheduler {
       this.saveTasksToDisk();
     }
     return task;
+  }
+
+  private markPhaseStart(
+    task: RenewalTask,
+    phase: NonNullable<RenewalTask['currentPhase']>,
+    detail?: string
+  ): void {
+    task.currentPhase = phase;
+    task.phaseDetail = detail;
+    task.phaseTimeline.push({
+      phase,
+      startedAt: new Date(),
+      detail,
+    });
+    this.tasks.set(task.domain, { ...task });
+  }
+
+  private markPhaseEnd(
+    task: RenewalTask,
+    phase: NonNullable<RenewalTask['currentPhase']>,
+    error?: string
+  ): void {
+    const entry = task.phaseTimeline.find(
+      (t) => t.phase === phase && !t.endedAt
+    );
+    if (entry) {
+      entry.endedAt = new Date();
+      entry.durationMs = entry.endedAt.getTime() - entry.startedAt.getTime();
+      entry.error = error;
+    }
+    task.currentPhase = 'idle';
+    task.phaseDetail = error;
+    this.tasks.set(task.domain, { ...task });
   }
 
   updateTaskPhase(

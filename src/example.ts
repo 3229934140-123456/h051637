@@ -227,6 +227,104 @@ async function exampleUsage() {
   console.log('    console.log(`${b.domain}: ${b.consecutiveFailures}x failed, next=${b.nextAttemptAt}`);');
   console.log('  }\n');
 
+  console.log('========================================');
+  console.log('  Example: Phase Timeline (细粒度时间线)');
+  console.log('========================================\n');
+
+  console.log('Each renewal / certificate request tracks detailed phase timings:');
+  console.log('  const task = manager.getRenewalScheduler()?.getTaskForDomain("example.com");');
+  console.log('  if (task) {');
+  console.log('    for (const phase of task.phaseTimeline) {');
+  console.log('      console.log(`${phase.phase}: started=${phase.startedAt}, duration=${phase.durationMs}ms`);');
+  console.log('      if (phase.error) console.log(`  ERROR: ${phase.error}`);');
+  console.log('      if (phase.endedAt) console.log(`  ended at ${phase.endedAt}`);');
+  console.log('    }');
+  console.log('  }\n');
+  console.log('Phases: checking → ordering → challenging → finalizing → downloading → installing → cleaning\n');
+
+  console.log('========================================');
+  console.log('  Example: Canary Deployment (灰度切换)');
+  console.log('========================================\n');
+
+  console.log('Start canary - new cert first goes to test domains only:');
+  console.log('  await manager.startCanary({');
+  console.log('    domains: ["test.example.com", "probe.example.com"],');
+  console.log('    canarySerialNumber: "abc123...",   // new certificate serial');
+  console.log('  });\n');
+
+  console.log('Run probes to verify the canary is working:');
+  console.log('  for (let i = 0; i < 5; i++) {');
+  console.log('    const result = await manager.probeCanary("test.example.com");');
+  console.log('    if (!result.success) {');
+  console.log('      console.log("Probe failed, rolling back!");');
+  console.log('      await manager.rollbackCanary();');
+  console.log('      break;');
+  console.log('    } else {');
+  console.log('      console.log(`Probe ok: peerCert=${result.peerCertSubjectCN}, tls=${result.tlsVersion}`);');
+  console.log('    }');
+  console.log('  }\n');
+
+  console.log('Check canary status:');
+  console.log('  const status = manager.getCanaryStatus();');
+  console.log('  console.log(`Canary active: ${status.active}`);');
+  console.log('  console.log(`Probe results: ${status.successCount} success, ${status.failureCount} failures`);');
+  console.log('  console.log(`Ready to promote: ${status.readyToPromote}`);');
+  console.log('  console.log(`Ready to rollback: ${status.readyToRollback}`);\n');
+
+  console.log('Promote when ready (replaces baseline for all traffic):');
+  console.log('  if (status.readyToPromote) {');
+  console.log('    await manager.promoteCanary();');
+  console.log('    console.log("Canary promoted - all traffic now uses new cert");');
+  console.log('  }\n');
+
+  console.log('Rollback if problems detected:');
+  console.log('  if (status.readyToRollback) {');
+  console.log('    await manager.rollbackCanary();');
+  console.log('    console.log("Canary rolled back - baseline cert restored");');
+  console.log('  }\n');
+
+  console.log('Note: During canary, baseline cert is NEVER deleted - always available as fallback\n');
+
+  console.log('========================================');
+  console.log('  Example: Prometheus Metrics (文本指标)');
+  console.log('========================================\n');
+
+  console.log('Export metrics in Prometheus text format:');
+  console.log('  // HTTP handler for /metrics endpoint:');
+  console.log('  app.get("/metrics", async (req, res) => {');
+  console.log('    res.set("Content-Type", "text/plain; version=0.0.4");');
+  console.log('    res.send(await manager.getPrometheusMetrics());');
+  console.log('  });\n');
+
+  console.log('Available metrics:');
+  console.log('  - acme_certificate_days_remaining{domain,serial,issuer}');
+  console.log('  - acme_certificate_expires_at_timestamp{domain,serial}');
+  console.log('  - acme_renewal_consecutive_failures{domain}');
+  console.log('  - acme_tls_handshakes_total / successful / failed');
+  console.log('  - acme_tls_sni_matches_total / sni_fallback_total / sni_mismatch_total');
+  console.log('  - acme_tls_canary_hits_total / canary_misses_total');
+  console.log('  - acme_challenges_served_total');
+  console.log('  - acme_canary_active / success_count / failure_count');
+  console.log('  - and many more...\n');
+
+  console.log('========================================');
+  console.log('  Example: Default Cert Switch Verification');
+  console.log('========================================\n');
+
+  console.log('After renewal, verify default certificate is live:');
+  console.log('  const probe = await manager.probeDefaultCertificate();');
+  console.log('  if (probe.success && probe.actualSerial === probe.expectedSerial) {');
+  console.log('    console.log(`✓ Switch verified: ${probe.domain} now uses serial ${probe.actualSerial}`);');
+  console.log('    console.log(`  Subject: ${probe.actualSubject}`);');
+  console.log('    console.log(`  Valid until: ${probe.validTo}`);');
+  console.log('  } else {');
+  console.log('    console.log(`✗ Switch NOT verified: expected=${probe.expectedSerial}, actual=${probe.actualSerial}`);');
+  console.log('    console.log(`  Error: ${probe.error}`);');
+  console.log('  }\n');
+
+  console.log('Important: Non-SNI connections and SNI-mismatch fallbacks automatically');
+  console.log('use the latest default certificate after renewal. No cache staleness.\n');
+
   console.log('[Cleanup] This is a demo - not starting servers in example mode.');
   console.log('In production, call: await manager.start(handler)');
   console.log('');

@@ -160,6 +160,14 @@ export interface RenewalTask {
   }>;
   currentPhase?: 'idle' | 'checking' | 'ordering' | 'challenging' | 'finalizing' | 'downloading' | 'installing' | 'cleaning';
   phaseDetail?: string;
+  phaseTimeline: Array<{
+    phase: RenewalTask['currentPhase'];
+    startedAt: Date;
+    endedAt?: Date;
+    durationMs?: number;
+    error?: string;
+    detail?: string;
+  }>;
 }
 
 export type OperationType = 'initial-issue' | 'renewal' | 'manual-request' | 'force-renewal';
@@ -173,6 +181,15 @@ export interface DomainOperationRecord {
   serialNumber?: string;
   challengeType: ChallengeType;
   phase?: RenewalTask['currentPhase'];
+  phaseDetail?: string;
+  phaseTimeline: Array<{
+    phase: RenewalTask['currentPhase'];
+    startedAt: Date;
+    endedAt?: Date;
+    durationMs?: number;
+    error?: string;
+    detail?: string;
+  }>;
 }
 
 export interface DomainLifecycleStatus {
@@ -259,6 +276,7 @@ export interface HealthCheckResult {
       defaultDomain: string | null;
       expiresAt?: Date;
       daysUntilExpiry?: number;
+      serialNumber?: string;
       detail?: string;
     };
     renewalScheduler: {
@@ -275,6 +293,17 @@ export interface HealthCheckResult {
       writable: boolean;
       totalCertificates: number;
       detail?: string;
+    };
+    canary?: {
+      healthy: boolean;
+      active: boolean;
+      canaryDomains: string[];
+      canarySerialNumber: string | null;
+      baselineSerialNumber: string | null;
+      successCount: number;
+      failureCount: number;
+      readyToPromote: boolean;
+      readyToRollback: boolean;
     };
   };
   summary: string[];
@@ -304,12 +333,19 @@ export interface ManagedServiceStatus {
     httpPort: number;
     httpsPort: number;
     defaultDomain: string | null;
+    defaultSerialNumber: string | null;
+    canaryStatus?: CanaryStatus;
     stats: {
       totalTlsHandshakes: number;
       successfulHandshakes: number;
       failedHandshakes: number;
+      sniMatches: number;
+      sniFallbackCount: number;
+      sniMismatchCount: number;
       cachedContextHits: number;
       cachedContextMisses: number;
+      canaryHits: number;
+      canaryMisses: number;
       httpRedirects: number;
       challengesServed: number;
       activeConnections: number;
@@ -339,6 +375,38 @@ export interface DomainRenewalHistory {
     lastFailureAt?: Date;
     lastFailureError?: string;
   };
+}
+
+export interface CanaryResult {
+  domain: string;
+  serialNumber: string;
+  timestamp: Date;
+  success: boolean;
+  tlsVersion?: string;
+  cipher?: string;
+  error?: string;
+  peerCertSerial?: string;
+  peerCertSubject?: Record<string, string>;
+  peerCertIssuer?: Record<string, string>;
+  peerCertSubjectCN?: string;
+  peerCertIssuerCN?: string;
+  peerCertValidFrom?: Date;
+  peerCertValidTo?: Date;
+}
+
+export interface CanaryStatus {
+  active: boolean;
+  canaryDomains: string[];
+  canarySerialNumber: string | null;
+  canaryCertExpiresAt?: Date;
+  baselineSerialNumber: string | null;
+  baselineCertExpiresAt?: Date;
+  canaryInstalledAt?: Date | null;
+  results: CanaryResult[];
+  successCount: number;
+  failureCount: number;
+  readyToPromote: boolean;
+  readyToRollback: boolean;
 }
 
 export interface CertificateStorageConfig {

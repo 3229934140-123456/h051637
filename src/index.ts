@@ -25,6 +25,8 @@ import {
   DomainRenewalHistory,
   DomainOperationRecord,
   OperationType,
+  CanaryResult,
+  CanaryStatus,
 } from './types';
 
 import { AcmeClient } from './acme-client';
@@ -189,7 +191,15 @@ export class AcmeTlsManager {
         status: 'running',
         challengeType: update.challengeType || 'http-01',
         phase: update.phase,
+        phaseTimeline: [],
       };
+      if (update.phaseTimeline) {
+        record.phaseTimeline = update.phaseTimeline;
+      } else if (update.phase) {
+        record.phaseTimeline = [
+          { phase: update.phase, startedAt: new Date(), detail: update.phaseDetail },
+        ];
+      }
       logs.unshift(record);
     } else {
       const current = logs.find((r) => r.status === 'running' && r.type === type);
@@ -208,6 +218,7 @@ export class AcmeTlsManager {
           error: update.error,
           serialNumber: update.serialNumber,
           phase: update.phase,
+          phaseTimeline: update.phaseTimeline || [],
         };
         logs.unshift(record);
       }
@@ -297,6 +308,42 @@ export class AcmeTlsManager {
           `[AcmeTlsManager] Renewal succeeded: ${oldCert.domain} (${oldCert.serialNumber} -> ${newCert.serialNumber})`
         );
         this.tlsTermination!.invalidateContextCacheForDomains(newCert.domains);
+
+        const defaultDomain = this.tlsTermination!.getDefaultDomain();
+        if (defaultDomain && newCert.domains.includes(defaultDomain)) {
+          this.tlsTermination!.setDefaultDomain(defaultDomain);
+        }
+
+        await this.sleep(1000);
+
+        let probeSuccess = false;
+        if (defaultDomain && newCert.domains.includes(defaultDomain)) {
+          const probe = await this.probeDefaultCertificate();
+          probeSuccess = probe.success && probe.actualSerial === newCert.serialNumber;
+          if (probeSuccess) {
+            console.log(
+              `[AcmeTlsManager] Probe confirmed: default domain ${defaultDomain} now uses serial ${probe.actualSerial}`
+            );
+          } else {
+            console.warn(
+              `[AcmeTlsManager] Probe failed: expected ${newCert.serialNumber}, got ${probe.actualSerial || probe.error}`
+            );
+          }
+        } else {
+          probeSuccess = true;
+        }
+
+        if (probeSuccess) {
+          await this.certStore!.removeCertificate(oldCert.serialNumber);
+          console.log(
+            `[AcmeTlsManager] Old certificate removed: ${oldCert.domain} (serial: ${oldCert.serialNumber})`
+          );
+        } else {
+          console.warn(
+            `[AcmeTlsManager] Keeping old certificate ${oldCert.serialNumber} as fallback due to probe failure`
+          );
+        }
+
         this.recordOperation(newCert.domain, 'renewal', {
           status: 'success',
           serialNumber: newCert.serialNumber,
@@ -802,6 +849,8 @@ export class AcmeTlsManager {
       httpRedirects: 0,
       challengesServed: 0,
       activeConnections: 0,
+      canaryHits: 0,
+      canaryMisses: 0,
     };
 
     const renewalSchedulerStatus = this.renewalScheduler?.getStatus() || {
@@ -818,6 +867,10 @@ export class AcmeTlsManager {
     };
 
     const renewalTasks = this.renewalScheduler?.getRenewalTasks() || [];
+    const defaultSerial = this.tlsTermination
+      ? await this.tlsTermination.getDefaultCertificateSerial()
+      : null;
+    const canaryStatus = this.tlsTermination?.getCanaryStatus() || null;
 
     return {
       initialized: this.isInitialized,
@@ -837,12 +890,19 @@ export class AcmeTlsManager {
         httpPort: this.tlsTermination?.getConfig().httpPort ?? 80,
         httpsPort: this.tlsTermination?.getConfig().httpsPort ?? 443,
         defaultDomain: this.tlsTermination?.getDefaultDomain() ?? null,
+        defaultSerialNumber: defaultSerial,
+        canaryStatus: canaryStatus ?? undefined,
         stats: {
           totalTlsHandshakes: tlsStats.totalTlsHandshakes,
           successfulHandshakes: tlsStats.successfulHandshakes,
           failedHandshakes: tlsStats.failedHandshakes,
           cachedContextHits: tlsStats.cachedContextHits,
           cachedContextMisses: tlsStats.cachedContextMisses,
+          sniMatches: tlsStats.sniMatches,
+          sniFallbackCount: tlsStats.sniFallbackCount,
+          sniMismatchCount: tlsStats.sniMismatchCount,
+          canaryHits: tlsStats.canaryHits,
+          canaryMisses: tlsStats.canaryMisses,
           httpRedirects: tlsStats.httpRedirects,
           challengesServed: tlsStats.challengesServed,
           activeConnections: tlsStats.activeConnections,
@@ -906,9 +966,12 @@ export class AcmeTlsManager {
     let hasDefaultCert = false;
     let defaultCertExpiry: Date | undefined;
     let defaultCertDays: number | undefined;
+    let defaultCertSerial: string | undefined;
 
     if (this.tlsTermination) {
       defaultDomain = this.tlsTermination.getDefaultDomain();
+      const serial = await this.tlsTermination.getDefaultCertificateSerial();
+      defaultCertSerial = serial ?? undefined;
       if (defaultDomain) {
         const cert = await this.certStore!.getCertificateByDomain(defaultDomain);
         if (cert) {
@@ -917,6 +980,7 @@ export class AcmeTlsManager {
           defaultCertDays = Math.ceil(
             (cert.expiresAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000)
           );
+          defaultCertSerial = cert.serialNumber;
         }
       }
     }
@@ -932,10 +996,11 @@ export class AcmeTlsManager {
       defaultDomain,
       expiresAt: defaultCertExpiry,
       daysUntilExpiry: defaultCertDays,
+      serialNumber: defaultCertSerial,
       detail: hasDefaultCert
         ? defaultCertDays && defaultCertDays > minDays
-          ? `Default certificate for ${defaultDomain} valid for ${defaultCertDays} day(s)`
-          : `Default certificate for ${defaultDomain} expires in ${defaultCertDays} day(s) (threshold: ${minDays})`
+          ? `Default certificate for ${defaultDomain} valid for ${defaultCertDays} day(s) (serial: ${defaultCertSerial})`
+          : `Default certificate for ${defaultDomain} expires in ${defaultCertDays} day(s) (threshold: ${minDays}, serial: ${defaultCertSerial})`
         : defaultDomain
           ? `No certificate found for default domain ${defaultDomain}`
           : 'No default domain configured',
@@ -1022,6 +1087,12 @@ export class AcmeTlsManager {
       renewalScheduler.healthy &&
       storageHealthy;
 
+    const canary = this.tlsTermination?.getCanaryStatus() || null;
+    const canaryHealthy =
+      canary && canary.active
+        ? !canary.readyToRollback
+        : true;
+
     return {
       healthy,
       timestamp: now,
@@ -1036,11 +1107,357 @@ export class AcmeTlsManager {
         httpsDefaultCert,
         renewalScheduler,
         storage,
+        canary: canary
+          ? {
+              healthy: canaryHealthy,
+              active: canary.active,
+              canaryDomains: canary.canaryDomains,
+              canarySerialNumber: canary.canarySerialNumber,
+              baselineSerialNumber: canary.baselineSerialNumber,
+              successCount: canary.successCount,
+              failureCount: canary.failureCount,
+              readyToPromote: canary.readyToPromote,
+              readyToRollback: canary.readyToRollback,
+            }
+          : undefined,
       },
       summary,
       warnings,
       criticals,
     };
+  }
+
+  async startCanary(options: {
+    domains: string[];
+    canarySerialNumber: string;
+    baselineSerialNumber?: string;
+  }): Promise<CanaryStatus> {
+    if (!this.isInitialized) {
+      await this.initialize();
+    }
+
+    if (!this.tlsTermination) {
+      throw new Error('TLS termination not initialized');
+    }
+
+    let baselineSerial: string | undefined = options.baselineSerialNumber;
+    if (!baselineSerial) {
+      const serial = await this.tlsTermination.getDefaultCertificateSerial();
+      baselineSerial = serial ?? undefined;
+    }
+
+    if (!baselineSerial) {
+      throw new Error('Could not determine baseline certificate serial number');
+    }
+
+    this.tlsTermination.setCanaryConfig({
+      canaryDomains: options.domains,
+      canarySerialNumber: options.canarySerialNumber,
+      baselineSerialNumber: baselineSerial,
+    });
+
+    return this.getCanaryStatus();
+  }
+
+  async probeCanary(domain: string): Promise<CanaryResult> {
+    if (!this.tlsTermination) {
+      throw new Error('TLS termination not initialized');
+    }
+    return this.tlsTermination.probeCanary(domain);
+  }
+
+  getCanaryStatus(): CanaryStatus {
+    if (!this.tlsTermination) {
+      return {
+        active: false,
+        canaryDomains: [],
+        canarySerialNumber: null,
+        baselineSerialNumber: null,
+        successCount: 0,
+        failureCount: 0,
+        readyToPromote: false,
+        readyToRollback: false,
+        results: [],
+      };
+    }
+    const s = this.tlsTermination.getCanaryStatus();
+    return {
+      active: s.active,
+      canaryDomains: s.canaryDomains,
+      canarySerialNumber: s.canarySerialNumber,
+      baselineSerialNumber: s.baselineSerialNumber,
+      successCount: s.successCount,
+      failureCount: s.failureCount,
+      readyToPromote: s.readyToPromote,
+      readyToRollback: s.readyToRollback,
+      results: s.results,
+    };
+  }
+
+  async promoteCanary(): Promise<CanaryStatus> {
+    if (!this.tlsTermination) {
+      throw new Error('TLS termination not initialized');
+    }
+
+    const status = this.getCanaryStatus();
+    if (!status.active && !status.readyToPromote) {
+      console.warn(
+        `[AcmeTlsManager] Promoting canary but not ready (${status.successCount} success, ${status.failureCount} failures)`
+      );
+    }
+
+    this.tlsTermination.promoteCanary();
+
+    const canarySerial = status.canarySerialNumber;
+    const baselineSerial = status.baselineSerialNumber;
+
+    if (canarySerial && baselineSerial && canarySerial !== baselineSerial) {
+      const defaultDomain = this.tlsTermination.getDefaultDomain();
+      if (defaultDomain) {
+        const cert = await this.certStore!.getCertificateByDomain(defaultDomain);
+        if (cert && cert.serialNumber === canarySerial) {
+          this.tlsTermination.setDefaultDomain(defaultDomain);
+        }
+      }
+
+      await this.sleep(1000);
+
+      const probeResult = await this.probeDefaultCertificate();
+      if (probeResult.success && probeResult.actualSerial !== canarySerial) {
+        console.warn(
+          `[AcmeTlsManager] Promoted but probe shows serial ${probeResult.actualSerial}, expected ${canarySerial}`
+        );
+      }
+    }
+
+    return this.getCanaryStatus();
+  }
+
+  async rollbackCanary(): Promise<CanaryStatus> {
+    if (!this.tlsTermination) {
+      throw new Error('TLS termination not initialized');
+    }
+
+    const status = this.getCanaryStatus();
+
+    if (!status.active) {
+      throw new Error('No canary deployment active');
+    }
+
+    this.tlsTermination.rollbackCanary();
+
+    return this.getCanaryStatus();
+  }
+
+  async probeDefaultCertificate(): Promise<{
+    success: boolean;
+    domain: string | null;
+    expectedSerial: string | null;
+    actualSerial?: string;
+    actualSubject?: string;
+    actualIssuer?: string;
+    validTo?: Date;
+    error?: string;
+  }> {
+    if (!this.tlsTermination) {
+      return {
+        success: false,
+        domain: null,
+        expectedSerial: null,
+        error: 'TLS termination not initialized',
+      };
+    }
+    return this.tlsTermination.probeDefaultCertificate();
+  }
+
+  async getPrometheusMetrics(): Promise<string> {
+    if (!this.isInitialized) {
+      await this.initialize();
+    }
+
+    const lines: string[] = [];
+    const now = Date.now();
+
+    lines.push('# HELP acme_manager_info ACME TLS manager info');
+    lines.push('# TYPE acme_manager_info gauge');
+    lines.push(
+      `acme_manager_info{version="1.0.0",initialized="${this.isInitialized}",started="${this.isStarted}"} 1`
+    );
+
+    if (this.startTime > 0) {
+      const uptimeSeconds = Math.floor((now - this.startTime) / 1000);
+      lines.push('# HELP acme_manager_uptime_seconds Uptime of the manager in seconds');
+      lines.push('# TYPE acme_manager_uptime_seconds gauge');
+      lines.push(`acme_manager_uptime_seconds ${uptimeSeconds}`);
+    }
+
+    const allCerts = await this.certStore!.getAllCertificates();
+    lines.push('# HELP acme_certificate_days_remaining Days remaining until certificate expiry');
+    lines.push('# TYPE acme_certificate_days_remaining gauge');
+
+    for (const cert of allCerts) {
+      const daysRemaining = Math.max(
+        0,
+        Math.ceil(
+          (cert.expiresAt.getTime() - now) / (24 * 60 * 60 * 1000)
+        )
+      );
+      const domainLabel = cert.domain.replace(/"/g, '\\"');
+      const serialLabel = cert.serialNumber.replace(/"/g, '\\"');
+      lines.push(
+        `acme_certificate_days_remaining{domain="${domainLabel}",serial="${serialLabel}",issuer="${cert.issuer.replace(/"/g, '\\"')}"} ${daysRemaining}`
+      );
+    }
+
+    lines.push('# HELP acme_certificate_expires_at_timestamp Unix timestamp when certificate expires');
+    lines.push('# TYPE acme_certificate_expires_at_timestamp gauge');
+    for (const cert of allCerts) {
+      const domainLabel = cert.domain.replace(/"/g, '\\"');
+      const serialLabel = cert.serialNumber.replace(/"/g, '\\"');
+      lines.push(
+        `acme_certificate_expires_at_timestamp{domain="${domainLabel}",serial="${serialLabel}"} ${Math.floor(cert.expiresAt.getTime() / 1000)}`
+      );
+    }
+
+    lines.push('# HELP acme_certificate_info Information about managed certificates');
+    lines.push('# TYPE acme_certificate_info gauge');
+    for (const cert of allCerts) {
+      const domainLabel = cert.domain.replace(/"/g, '\\"');
+      const serialLabel = cert.serialNumber.replace(/"/g, '\\"');
+      const issuerLabel = cert.issuer.replace(/"/g, '\\"');
+      const challengeType = cert.challengeType || 'unknown';
+      lines.push(
+        `acme_certificate_info{domain="${domainLabel}",serial="${serialLabel}",issuer="${issuerLabel}",challenge_type="${challengeType}"} 1`
+      );
+    }
+
+    const consecutiveFailures = this.renewalScheduler
+      ? this.renewalScheduler.getConsecutiveFailures()
+      : [];
+
+    lines.push('# HELP acme_renewal_consecutive_failures Consecutive renewal failures per domain');
+    lines.push('# TYPE acme_renewal_consecutive_failures gauge');
+    for (const cf of consecutiveFailures) {
+      const domainLabel = cf.domain.replace(/"/g, '\\"');
+      lines.push(
+        `acme_renewal_consecutive_failures{domain="${domainLabel}"} ${cf.consecutiveFailures}`
+      );
+    }
+
+    const renewalTasks = this.renewalScheduler?.getRenewalTasks() || [];
+
+    lines.push('# HELP acme_renewal_task_status Status of renewal tasks');
+    lines.push('# TYPE acme_renewal_task_status gauge');
+    for (const task of renewalTasks) {
+      const domainLabel = task.domain.replace(/"/g, '\\"');
+      const statusLabel = task.status;
+      lines.push(
+        `acme_renewal_task_status{domain="${domainLabel}",status="${statusLabel}"} 1`
+      );
+    }
+
+    lines.push('# HELP acme_renewal_task_attempts Total renewal attempts per domain');
+    lines.push('# TYPE acme_renewal_task_attempts counter');
+    for (const task of renewalTasks) {
+      const domainLabel = task.domain.replace(/"/g, '\\"');
+      lines.push(
+        `acme_renewal_task_attempts{domain="${domainLabel}"} ${task.attempts}`
+      );
+    }
+
+    const tlsStats = this.tlsTermination?.getStats() || null;
+
+    if (tlsStats) {
+      lines.push('# HELP acme_tls_handshakes_total Total number of TLS handshake attempts');
+      lines.push('# TYPE acme_tls_handshakes_total counter');
+      lines.push(`acme_tls_handshakes_total ${tlsStats.totalTlsHandshakes}`);
+
+      lines.push('# HELP acme_tls_handshakes_successful_total Total number of successful TLS handshakes');
+      lines.push('# TYPE acme_tls_handshakes_successful_total counter');
+      lines.push(`acme_tls_handshakes_successful_total ${tlsStats.successfulHandshakes}`);
+
+      lines.push('# HELP acme_tls_handshakes_failed_total Total number of failed TLS handshakes');
+      lines.push('# TYPE acme_tls_handshakes_failed_total counter');
+      lines.push(`acme_tls_handshakes_failed_total ${tlsStats.failedHandshakes}`);
+
+      lines.push('# HELP acme_tls_sni_matches_total Total number of SNI matches');
+      lines.push('# TYPE acme_tls_sni_matches_total counter');
+      lines.push(`acme_tls_sni_matches_total ${tlsStats.sniMatches}`);
+
+      lines.push('# HELP acme_tls_sni_fallback_total Total number of SNI fallback to default certificate');
+      lines.push('# TYPE acme_tls_sni_fallback_total counter');
+      lines.push(`acme_tls_sni_fallback_total ${tlsStats.sniFallbackCount}`);
+
+      lines.push('# HELP acme_tls_sni_mismatch_total Total number of SNI mismatch errors');
+      lines.push('# TYPE acme_tls_sni_mismatch_total counter');
+      lines.push(`acme_tls_sni_mismatch_total ${tlsStats.sniMismatchCount}`);
+
+      lines.push('# HELP acme_tls_context_cache_hits_total Total number of TLS context cache hits');
+      lines.push('# TYPE acme_tls_context_cache_hits_total counter');
+      lines.push(`acme_tls_context_cache_hits_total ${tlsStats.cachedContextHits}`);
+
+      lines.push('# HELP acme_tls_context_cache_misses_total Total number of TLS context cache misses');
+      lines.push('# TYPE acme_tls_context_cache_misses_total counter');
+      lines.push(`acme_tls_context_cache_misses_total ${tlsStats.cachedContextMisses}`);
+
+      lines.push('# HELP acme_tls_canary_hits_total Total number of canary routing hits');
+      lines.push('# TYPE acme_tls_canary_hits_total counter');
+      lines.push(`acme_tls_canary_hits_total ${tlsStats.canaryHits}`);
+
+      lines.push('# HELP acme_tls_canary_misses_total Total number of canary routing misses');
+      lines.push('# TYPE acme_tls_canary_misses_total counter');
+      lines.push(`acme_tls_canary_misses_total ${tlsStats.canaryMisses}`);
+
+      lines.push('# HELP acme_http_redirects_total Total number of HTTP redirects');
+      lines.push('# TYPE acme_http_redirects_total counter');
+      lines.push(`acme_http_redirects_total ${tlsStats.httpRedirects}`);
+
+      lines.push('# HELP acme_challenges_served_total Total number of ACME challenges served');
+      lines.push('# TYPE acme_challenges_served_total counter');
+      lines.push(`acme_challenges_served_total ${tlsStats.challengesServed}`);
+
+      lines.push('# HELP acme_tls_active_connections Current number of active TLS connections');
+      lines.push('# TYPE acme_tls_active_connections gauge');
+      lines.push(`acme_tls_active_connections ${tlsStats.activeConnections}`);
+    }
+
+    const canaryStatus = this.tlsTermination?.getCanaryStatus() || null;
+    if (canaryStatus && canaryStatus.active) {
+      lines.push('# HELP acme_canary_active Whether a canary deployment is active');
+      lines.push('# TYPE acme_canary_active gauge');
+      lines.push(`acme_canary_active 1`);
+
+      lines.push('# HELP acme_canary_success_count Number of successful canary probes');
+      lines.push('# TYPE acme_canary_success_count gauge');
+      lines.push(`acme_canary_success_count ${canaryStatus.successCount}`);
+
+      lines.push('# HELP acme_canary_failure_count Number of failed canary probes');
+      lines.push('# TYPE acme_canary_failure_count gauge');
+      lines.push(`acme_canary_failure_count ${canaryStatus.failureCount}`);
+
+      lines.push('# HELP acme_canary_ready_to_promote Whether canary is ready to promote');
+      lines.push('# TYPE acme_canary_ready_to_promote gauge');
+      lines.push(`acme_canary_ready_to_promote ${canaryStatus.readyToPromote ? 1 : 0}`);
+
+      lines.push('# HELP acme_canary_ready_to_rollback Whether canary is ready to rollback');
+      lines.push('# TYPE acme_canary_ready_to_rollback gauge');
+      lines.push(`acme_canary_ready_to_rollback ${canaryStatus.readyToRollback ? 1 : 0}`);
+    } else {
+      lines.push('# HELP acme_canary_active Whether a canary deployment is active');
+      lines.push('# TYPE acme_canary_active gauge');
+      lines.push(`acme_canary_active 0`);
+    }
+
+    const storageStats = this.certStore!.getStorageStats();
+    lines.push('# HELP acme_storage_certificates_total Total number of certificates in storage');
+    lines.push('# TYPE acme_storage_certificates_total gauge');
+    lines.push(`acme_storage_certificates_total ${storageStats.totalCertificates}`);
+
+    lines.push('# HELP acme_storage_domains_total Total number of managed domains');
+    lines.push('# TYPE acme_storage_domains_total gauge');
+    lines.push(`acme_storage_domains_total ${storageStats.managedDomains}`);
+
+    return lines.join('\n') + '\n';
   }
 
   getRenewalHistory(

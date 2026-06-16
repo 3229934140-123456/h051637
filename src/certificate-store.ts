@@ -275,19 +275,6 @@ export class CertificateStore {
     return this.getCertificateBySerial(serial);
   }
 
-  async getCertificateBySerial(
-    serialNumber: string
-  ): Promise<StoredCertificate | null> {
-    const cached = this.certCache.get(serialNumber);
-    if (!cached) {
-      return null;
-    }
-
-    return {
-      ...cached,
-    };
-  }
-
   async getPrivateKeyForSerial(serialNumber: string): Promise<string | null> {
     const cert = this.certCache.get(serialNumber);
     if (!cert) {
@@ -323,6 +310,32 @@ export class CertificateStore {
     }
 
     const key = await this.getPrivateKeyForSerial(cert.serialNumber);
+    if (!key) {
+      return null;
+    }
+
+    return {
+      cert: cert.fullchain,
+      key,
+      ca: cert.chain || undefined,
+    };
+  }
+
+  async getCertificateBySerial(
+    serialNumber: string
+  ): Promise<StoredCertificate | null> {
+    return this.certCache.get(serialNumber) || null;
+  }
+
+  async getTlsContextForSerial(
+    serialNumber: string
+  ): Promise<{ cert: string; key: string; ca?: string } | null> {
+    const cert = this.certCache.get(serialNumber);
+    if (!cert) {
+      return null;
+    }
+
+    const key = await this.getPrivateKeyForSerial(serialNumber);
     if (!key) {
       return null;
     }

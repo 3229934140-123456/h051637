@@ -4,7 +4,7 @@ import * as tls from 'tls';
 import * as net from 'net';
 import * as crypto from 'crypto';
 import { CertificateStore } from './certificate-store';
-import { TLSTerminationConfig, StoredCertificate } from './types';
+import { TLSTerminationConfig, StoredCertificate, CanaryResult } from './types';
 import { ChallengeResponder } from './challenge-responder';
 
 export type RequestHandler = (
@@ -34,6 +34,8 @@ export interface TlsTerminationStats {
   httpRedirects: number;
   challengesServed: number;
   activeConnections: number;
+  canaryHits: number;
+  canaryMisses: number;
 }
 
 export class TLSTermination {
@@ -62,9 +64,26 @@ export class TLSTermination {
     httpRedirects: 0,
     challengesServed: 0,
     activeConnections: 0,
+    canaryHits: 0,
+    canaryMisses: 0,
   };
   private activeConnections: Set<net.Socket> = new Set();
   private certCacheWatcherInterval: NodeJS.Timeout | null = null;
+  private canaryConfig: {
+    active: boolean;
+    canaryDomains: string[];
+    canarySerialNumber: string | null;
+    baselineSerialNumber: string | null;
+    installedAt: Date | null;
+    results: CanaryResult[];
+  } = {
+    active: false,
+    canaryDomains: [],
+    canarySerialNumber: null,
+    baselineSerialNumber: null,
+    installedAt: null,
+    results: [],
+  };
 
   constructor(
     certStore: CertificateStore,
@@ -337,6 +356,49 @@ export class TLSTermination {
     ].join(':');
   }
 
+  private isCanaryDomain(domain: string): boolean {
+    if (!this.canaryConfig.active) {
+      return false;
+    }
+    const normalized = domain.toLowerCase();
+    for (const canary of this.canaryConfig.canaryDomains) {
+      const c = canary.toLowerCase();
+      if (c === normalized) {
+        return true;
+      }
+      if (c.startsWith('*.')) {
+        const suffix = c.slice(1);
+        if (normalized.endsWith(suffix) && normalized.length > suffix.length) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private async getDefaultContext(): Promise<tls.SecureContext> {
+    if (this.defaultDomain) {
+      const tlsCtx = await this.certStore.getTlsContextForDomain(
+        this.defaultDomain
+      );
+      if (tlsCtx) {
+        return tls.createSecureContext({
+          key: tlsCtx.key,
+          cert: tlsCtx.cert,
+          ca: tlsCtx.ca,
+          minVersion: 'TLSv1.2',
+          ciphers: this.getRecommendedCiphers(),
+          honorCipherOrder: true,
+        });
+      }
+    }
+
+    if (!this.defaultContext) {
+      this.defaultContext = this.createSelfSignedContext('localhost');
+    }
+    return this.defaultContext!;
+  }
+
   private async sniCallback(
     servername: string,
     cb: (err: Error | null, ctx?: tls.SecureContext) => void
@@ -353,9 +415,25 @@ export class TLSTermination {
 
       this.stats.cachedContextMisses++;
 
-      let tlsContext = await this.certStore.getTlsContextForDomain(
-        normalizedServername
-      );
+      let targetSerial: string | null = null;
+      if (this.isCanaryDomain(normalizedServername)) {
+        targetSerial = this.canaryConfig.canarySerialNumber;
+        this.stats.canaryHits++;
+      } else {
+        this.stats.canaryMisses++;
+      }
+
+      let tlsContext: { cert: string; key: string; ca?: string } | null = null;
+
+      if (targetSerial) {
+        tlsContext = await this.certStore.getTlsContextForSerial(targetSerial);
+      }
+
+      if (!tlsContext) {
+        tlsContext = await this.certStore.getTlsContextForDomain(
+          normalizedServername
+        );
+      }
 
       if (!tlsContext) {
         tlsContext = await this.findWildcardMatch(normalizedServername);
@@ -379,14 +457,16 @@ export class TLSTermination {
         console.warn(
           `[TLSTermination] No certificate found for SNI=${servername}, using default`
         );
-        cb(null, this.defaultContext || undefined);
+        const defaultCtx = await this.getDefaultContext();
+        cb(null, defaultCtx);
       }
     } catch (err) {
       this.stats.sniMismatchCount++;
       console.error(
         `[TLSTermination] SNI callback error for ${servername}: ${(err as Error).message}`
       );
-      cb(null, this.defaultContext || undefined);
+      const defaultCtx = await this.getDefaultContext();
+      cb(null, defaultCtx);
     }
   }
 
@@ -640,5 +720,286 @@ export class TLSTermination {
       httpPort: this.config.httpPort,
       httpsPort: this.config.httpsPort,
     };
+  }
+
+  setCanaryConfig(config: {
+    canaryDomains: string[];
+    canarySerialNumber: string;
+    baselineSerialNumber: string;
+  }): void {
+    this.canaryConfig = {
+      active: true,
+      canaryDomains: config.canaryDomains,
+      canarySerialNumber: config.canarySerialNumber,
+      baselineSerialNumber: config.baselineSerialNumber,
+      installedAt: new Date(),
+      results: [],
+    };
+
+    this.invalidateContextCacheForDomains(config.canaryDomains);
+
+    console.log(
+      `[TLSTermination] Canary deployment activated: ${config.canaryDomains.length} domain(s) -> serial ${config.canarySerialNumber}`
+    );
+  }
+
+  getCanaryStatus(): {
+    active: boolean;
+    canaryDomains: string[];
+    canarySerialNumber: string | null;
+    baselineSerialNumber: string | null;
+    canaryInstalledAt: Date | null;
+    results: CanaryResult[];
+    successCount: number;
+    failureCount: number;
+    readyToPromote: boolean;
+    readyToRollback: boolean;
+  } {
+    const successCount = this.canaryConfig.results.filter(
+      (r) => r.success
+    ).length;
+    const failureCount = this.canaryConfig.results.filter(
+      (r) => !r.success
+    ).length;
+    const totalProbes = successCount + failureCount;
+    const readyToPromote =
+      this.canaryConfig.active &&
+      totalProbes >= 3 &&
+      failureCount === 0;
+    const readyToRollback =
+      this.canaryConfig.active && failureCount > 0;
+
+    return {
+      active: this.canaryConfig.active,
+      canaryDomains: [...this.canaryConfig.canaryDomains],
+      canarySerialNumber: this.canaryConfig.canarySerialNumber,
+      baselineSerialNumber: this.canaryConfig.baselineSerialNumber,
+      canaryInstalledAt: this.canaryConfig.installedAt,
+      results: [...this.canaryConfig.results],
+      successCount,
+      failureCount,
+      readyToPromote,
+      readyToRollback,
+    };
+  }
+
+  async probeCanary(domain: string): Promise<CanaryResult> {
+    const host = this.config.httpsPort === 443 ? domain : `${domain}:${this.config.httpsPort}`;
+
+    try {
+      const result = await new Promise<CanaryResult>((resolve, reject) => {
+        const socket = tls.connect(
+          {
+            host: domain,
+            port: this.config.httpsPort,
+            servername: domain,
+            rejectUnauthorized: false,
+            timeout: 5000,
+          },
+          () => {
+            const peerCert = socket.getPeerCertificate();
+            const subject = peerCert.subject as Record<string, string>;
+            const issuer = peerCert.issuer as Record<string, string>;
+            const result: CanaryResult = {
+              domain,
+              serialNumber: this.canaryConfig.canarySerialNumber || '',
+              timestamp: new Date(),
+              success: true,
+              tlsVersion: socket.getProtocol() || undefined,
+              cipher: socket.getCipher()?.name,
+              peerCertSerial: peerCert.serialNumber,
+              peerCertSubject: subject,
+              peerCertIssuer: issuer,
+              peerCertSubjectCN: subject.CN,
+              peerCertIssuerCN: issuer.CN,
+              peerCertValidFrom: peerCert.valid_from
+                ? new Date(peerCert.valid_from)
+                : undefined,
+              peerCertValidTo: peerCert.valid_to
+                ? new Date(peerCert.valid_to)
+                : undefined,
+            };
+            socket.end();
+            resolve(result);
+          }
+        );
+
+        socket.on('error', (err) => {
+          const result: CanaryResult = {
+            domain,
+            serialNumber: this.canaryConfig.canarySerialNumber || '',
+            timestamp: new Date(),
+            success: false,
+            error: err.message,
+          };
+          reject(result);
+        });
+
+        socket.on('timeout', () => {
+          socket.destroy();
+          const result: CanaryResult = {
+            domain,
+            serialNumber: this.canaryConfig.canarySerialNumber || '',
+            timestamp: new Date(),
+            success: false,
+            error: 'Connection timeout',
+          };
+          reject(result);
+        });
+      });
+
+      if (this.canaryConfig.active) {
+        this.canaryConfig.results.push(result);
+        if (this.canaryConfig.results.length > 50) {
+          this.canaryConfig.results = this.canaryConfig.results.slice(-50);
+        }
+      }
+
+      return result;
+    } catch (result) {
+      if (this.canaryConfig.active) {
+        this.canaryConfig.results.push(result as CanaryResult);
+        if (this.canaryConfig.results.length > 50) {
+          this.canaryConfig.results = this.canaryConfig.results.slice(-50);
+        }
+      }
+      return result as CanaryResult;
+    }
+  }
+
+  promoteCanary(): void {
+    if (!this.canaryConfig.active) {
+      throw new Error('No canary deployment active');
+    }
+
+    const canaryDomains = [...this.canaryConfig.canaryDomains];
+    this.canaryConfig = {
+      active: false,
+      canaryDomains: [],
+      canarySerialNumber: null,
+      baselineSerialNumber: null,
+      installedAt: null,
+      results: [],
+    };
+
+    this.invalidateContextCache();
+
+    console.log(
+      `[TLSTermination] Canary promoted: ${canaryDomains.length} domain(s)`
+    );
+  }
+
+  rollbackCanary(): void {
+    if (!this.canaryConfig.active) {
+      throw new Error('No canary deployment active');
+    }
+
+    const canaryDomains = [...this.canaryConfig.canaryDomains];
+    const canarySerial = this.canaryConfig.canarySerialNumber;
+    this.canaryConfig = {
+      active: false,
+      canaryDomains: [],
+      canarySerialNumber: null,
+      baselineSerialNumber: null,
+      installedAt: null,
+      results: [],
+    };
+
+    this.invalidateContextCacheForDomains(canaryDomains);
+
+    console.log(
+      `[TLSTermination] Canary rolled back: ${canaryDomains.length} domain(s), serial ${canarySerial}`
+    );
+  }
+
+  async getDefaultCertificateSerial(): Promise<string | null> {
+    if (!this.defaultDomain) {
+      return null;
+    }
+    const cert = await this.certStore.getCertificateByDomain(
+      this.defaultDomain
+    );
+    return cert?.serialNumber || null;
+  }
+
+  async probeDefaultCertificate(): Promise<{
+    success: boolean;
+    domain: string | null;
+    expectedSerial: string | null;
+    actualSerial?: string;
+    actualSubject?: string;
+    actualIssuer?: string;
+    validTo?: Date;
+    error?: string;
+  }> {
+    const domain = this.defaultDomain;
+    const expectedSerial = await this.getDefaultCertificateSerial();
+
+    if (!domain) {
+      return {
+        success: false,
+        domain: null,
+        expectedSerial: null,
+        error: 'No default domain configured',
+      };
+    }
+
+    try {
+      return await new Promise((resolve) => {
+        const socket = tls.connect(
+          {
+            host: domain,
+            port: this.config.httpsPort,
+            servername: domain,
+            rejectUnauthorized: false,
+            timeout: 5000,
+          },
+          () => {
+            const peerCert = socket.getPeerCertificate();
+            const subject = peerCert.subject as Record<string, string>;
+            const issuer = peerCert.issuer as Record<string, string>;
+            const result = {
+              success: true,
+              domain,
+              expectedSerial,
+              actualSerial: peerCert.serialNumber,
+              actualSubject: subject.CN || JSON.stringify(subject),
+              actualIssuer: issuer.CN || JSON.stringify(issuer),
+              validTo: peerCert.valid_to
+                ? new Date(peerCert.valid_to)
+                : undefined,
+            };
+            socket.end();
+            resolve(result);
+          }
+        );
+
+        socket.on('error', (err) => {
+          resolve({
+            success: false,
+            domain,
+            expectedSerial,
+            error: err.message,
+          });
+        });
+
+        socket.on('timeout', () => {
+          socket.destroy();
+          resolve({
+            success: false,
+            domain,
+            expectedSerial,
+            error: 'Connection timeout',
+          });
+        });
+      });
+    } catch (err) {
+      return {
+        success: false,
+        domain,
+        expectedSerial,
+        error: (err as Error).message,
+      };
+    }
   }
 }
