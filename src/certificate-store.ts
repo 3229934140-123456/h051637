@@ -26,14 +26,14 @@ export class CertificateStore {
 
     if (this.config.encryptPrivateKeys && this.config.encryptionPassphrase) {
       this.encryptionKey = this.deriveKeyFromPassphrase(
-        this.config.encryptionPassphrase
+        this.config.encryptionPassphrase,
+        Buffer.alloc(16)
       );
     }
   }
 
-  private deriveKeyFromPassphrase(passphrase: string, salt?: Buffer): Buffer {
-    const actualSalt = salt || crypto.randomBytes(16);
-    return crypto.pbkdf2Sync(passphrase, actualSalt, 100000, 32, 'sha256');
+  private deriveKeyFromPassphrase(passphrase: string, salt: Buffer): Buffer {
+    return crypto.pbkdf2Sync(passphrase, salt, 100000, 32, 'sha256');
   }
 
   private encryptPrivateKey(privateKeyPem: string): string {
@@ -41,8 +41,10 @@ export class CertificateStore {
       return privateKeyPem;
     }
 
+    const salt = crypto.randomBytes(16);
+    const key = this.deriveKeyFromPassphrase(this.config.encryptionPassphrase, salt);
     const iv = crypto.randomBytes(16);
-    const cipher = crypto.createCipheriv('aes-256-gcm', this.encryptionKey, iv);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
 
     const encrypted = Buffer.concat([
       cipher.update(Buffer.from(privateKeyPem, 'utf8')),
@@ -52,7 +54,8 @@ export class CertificateStore {
     const authTag = cipher.getAuthTag();
 
     const result = {
-      v: 1,
+      v: 2,
+      salt: salt.toString('base64'),
       iv: iv.toString('base64'),
       tag: authTag.toString('base64'),
       data: encrypted.toString('base64'),
@@ -65,10 +68,6 @@ export class CertificateStore {
   }
 
   private decryptPrivateKey(encryptedKeyPem: string): string {
-    if (!this.encryptionKey) {
-      return encryptedKeyPem;
-    }
-
     if (!encryptedKeyPem.includes('BEGIN ENCRYPTED PRIVATE KEY')) {
       return encryptedKeyPem;
     }
@@ -82,13 +81,25 @@ export class CertificateStore {
       const jsonContent = Buffer.from(base64Content, 'base64').toString('utf8');
       const parsed = JSON.parse(jsonContent);
 
+      const salt = Buffer.from(parsed.salt, 'base64');
       const iv = Buffer.from(parsed.iv, 'base64');
       const tag = Buffer.from(parsed.tag, 'base64');
       const data = Buffer.from(parsed.data, 'base64');
 
+      let key: Buffer;
+      if (parsed.v === 2 && this.config.encryptionPassphrase) {
+        key = this.deriveKeyFromPassphrase(this.config.encryptionPassphrase, salt);
+      } else if (this.encryptionKey) {
+        key = this.encryptionKey;
+      } else if (this.config.encryptionPassphrase) {
+        key = this.deriveKeyFromPassphrase(this.config.encryptionPassphrase, salt);
+      } else {
+        throw new Error('No decryption key available');
+      }
+
       const decipher = crypto.createDecipheriv(
         'aes-256-gcm',
-        this.encryptionKey,
+        key,
         iv
       );
       decipher.setAuthTag(tag);
@@ -226,6 +237,7 @@ export class CertificateStore {
       issuedAt: cert.issuedAt,
       expiresAt: cert.expiresAt,
       issuer: cert.issuer,
+      challengeType: cert.challengeType,
       privateKeyEncrypted: this.config.encryptPrivateKeys,
     };
 
@@ -294,9 +306,12 @@ export class CertificateStore {
     }
 
     const content = fs.readFileSync(privKeyPath, 'utf8');
-    return this.config.encryptPrivateKeys
-      ? this.decryptPrivateKey(content)
-      : content;
+
+    if (content.includes('BEGIN ENCRYPTED PRIVATE KEY')) {
+      return this.decryptPrivateKey(content);
+    }
+
+    return content;
   }
 
   async getTlsContextForDomain(

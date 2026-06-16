@@ -5,6 +5,7 @@ import * as net from 'net';
 import * as crypto from 'crypto';
 import { CertificateStore } from './certificate-store';
 import { TLSTerminationConfig, StoredCertificate } from './types';
+import { ChallengeResponder } from './challenge-responder';
 
 export type RequestHandler = (
   req: http.IncomingMessage,
@@ -31,12 +32,14 @@ export interface TlsTerminationStats {
   httpRequestsForwarded: number;
   httpsRequestsForwarded: number;
   httpRedirects: number;
+  challengesServed: number;
   activeConnections: number;
 }
 
 export class TLSTermination {
   private config: Required<TLSTerminationConfig>;
   private certStore: CertificateStore;
+  private challengeResponder: ChallengeResponder;
   private requestHandler: RequestHandler | null = null;
   private httpsServer: https.Server | null = null;
   private httpServer: http.Server | null = null;
@@ -57,6 +60,7 @@ export class TLSTermination {
     httpRequestsForwarded: 0,
     httpsRequestsForwarded: 0,
     httpRedirects: 0,
+    challengesServed: 0,
     activeConnections: 0,
   };
   private activeConnections: Set<net.Socket> = new Set();
@@ -64,9 +68,11 @@ export class TLSTermination {
 
   constructor(
     certStore: CertificateStore,
+    challengeResponder: ChallengeResponder,
     config: Partial<TLSTerminationConfig>
   ) {
     this.certStore = certStore;
+    this.challengeResponder = challengeResponder;
     this.config = {
       httpPort: config.httpPort ?? 80,
       httpsPort: config.httpsPort ?? 443,
@@ -83,7 +89,15 @@ export class TLSTermination {
   async start(): Promise<void> {
     await this.buildDefaultContext();
 
-    await new Promise<void>((resolve, reject) => {
+    await this.startHttpsServer();
+
+    await this.startUnifiedHttpServer();
+
+    this.startCertCacheWatcher();
+  }
+
+  private async startHttpsServer(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
       this.httpsServer = https.createServer({
         SNICallback: (servername, cb) => this.sniCallback(servername, cb),
         key: undefined as any,
@@ -123,8 +137,17 @@ export class TLSTermination {
         this.handleRequest(req, res, true);
       });
 
-      this.httpsServer.on('error', (err) => {
-        reject(err);
+      this.httpsServer.on('error', (err: any) => {
+        if (err.code === 'EADDRINUSE') {
+          console.warn(
+            `[TLSTermination] HTTPS port ${this.config.httpsPort} is in use, retrying in 2s...`
+          );
+          setTimeout(() => {
+            this.httpsServer!.listen(this.config.httpsPort);
+          }, 2000);
+        } else {
+          reject(err);
+        }
       });
 
       this.httpsServer.listen(this.config.httpsPort, () => {
@@ -134,60 +157,33 @@ export class TLSTermination {
         resolve();
       });
     });
-
-    if (this.config.httpPort !== this.config.challengePort) {
-      await this.startHttpRedirectServer();
-    } else {
-      await this.startHttpServerWithChallenges();
-    }
-
-    this.startCertCacheWatcher();
   }
 
-  private async startHttpRedirectServer(): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      this.httpServer = http.createServer((req, res) => {
-        const host = req.headers['host'] || this.defaultDomain || 'localhost';
-        const targetHost = (host as string).replace(/:\d+$/, '');
-        const targetPort =
-          this.config.httpsPort === 443 ? '' : `:${this.config.httpsPort}`;
-        const redirectUrl = `https://${targetHost}${targetPort}${req.url}`;
-
-        this.stats.httpRedirects++;
-        console.debug(
-          `[TLSTermination] HTTP->HTTPS redirect: ${req.url} -> ${redirectUrl}`
-        );
-
-        res.writeHead(301, {
-          Location: redirectUrl,
-          'Cache-Control': 'max-age=3600',
-          'Strict-Transport-Security':
-            'max-age=31536000; includeSubDomains; preload',
-        });
-        res.end('Moved Permanently');
-      });
-
-      this.httpServer.on('error', (err) => {
-        reject(err);
-      });
-
-      this.httpServer.listen(this.config.httpPort, () => {
-        console.log(
-          `[TLSTermination] HTTP redirect server listening on port ${this.config.httpPort}`
-        );
-        resolve();
-      });
-    });
-  }
-
-  private async startHttpServerWithChallenges(): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
+  private async startUnifiedHttpServer(): Promise<void> {
+    return new Promise<void>((resolve) => {
       this.httpServer = http.createServer((req, res) => {
         const url = req.url || '/';
 
-        if (url.startsWith('/.well-known/acme-challenge/')) {
-          this.stats.httpRequestsForwarded++;
-          this.handleRequest(req, res, false);
+        if (this.challengeResponder.isChallengePath(url)) {
+          const result = this.challengeResponder.handleHttpChallengeRequest(url);
+          if (result.found && result.keyAuthorization) {
+            this.stats.challengesServed++;
+            res.statusCode = 200;
+            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+            res.setHeader('Cache-Control', 'no-store');
+            res.end(result.keyAuthorization);
+            return;
+          }
+
+          res.statusCode = 404;
+          res.setHeader('Content-Type', 'application/problem+json');
+          res.end(
+            JSON.stringify({
+              type: 'urn:ietf:params:acme:error:malformed',
+              detail: 'Challenge token not found',
+              status: 404,
+            })
+          );
           return;
         }
 
@@ -208,8 +204,19 @@ export class TLSTermination {
         res.end('Moved Permanently');
       });
 
-      this.httpServer.on('error', (err) => {
-        reject(err);
+      this.httpServer.on('error', (err: any) => {
+        if (err.code === 'EADDRINUSE') {
+          console.warn(
+            `[TLSTermination] HTTP port ${this.config.httpPort} is in use, retrying in 2s...`
+          );
+          setTimeout(() => {
+            this.httpServer!.listen(this.config.httpPort);
+          }, 2000);
+        } else {
+          console.error(
+            `[TLSTermination] HTTP server error: ${err.message}`
+          );
+        }
       });
 
       this.httpServer.listen(this.config.httpPort, () => {

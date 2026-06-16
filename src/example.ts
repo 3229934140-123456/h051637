@@ -35,7 +35,6 @@ async function exampleUsage() {
     storageDir: './example-data',
     useProduction: false,
     challenge: {
-      port: 8080,
       dnsProvider,
     },
     tls: {

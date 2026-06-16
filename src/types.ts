@@ -91,6 +91,7 @@ export interface StoredCertificate {
   issuedAt: Date;
   expiresAt: Date;
   issuer: string;
+  challengeType: ChallengeType;
 }
 
 export interface RenewalConfig {
@@ -101,7 +102,6 @@ export interface RenewalConfig {
 }
 
 export interface RenewalPolicy {
-  challengeType: ChallengeType;
   dnsProvider?: DnsProvider;
   onBeforeRenewal?: (cert: StoredCertificate) => Promise<void>;
   onRenewalSuccess?: (

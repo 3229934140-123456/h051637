@@ -1,117 +1,43 @@
-import * as http from 'http';
 import * as crypto from 'crypto';
 import { ChallengeToken, ChallengeType, DnsProvider } from './types';
 
 export class ChallengeResponder {
-  private httpServer: http.Server | null = null;
   private httpTokens: Map<string, ChallengeToken> = new Map();
-  private port: number;
   private dnsTokens: Map<string, ChallengeToken> = new Map();
   private dnsProvider: DnsProvider | null = null;
 
-  constructor(port: number = 80, dnsProvider?: DnsProvider) {
-    this.port = port;
+  constructor(dnsProvider?: DnsProvider) {
     this.dnsProvider = dnsProvider || null;
   }
 
-  async start(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.httpServer = http.createServer((req, res) => {
-        this.handleHttpRequest(req, res);
-      });
-
-      this.httpServer.on('error', (err: any) => {
-        if (err.code === 'EADDRINUSE') {
-          console.warn(
-            `[ChallengeResponder] Port ${this.port} is in use, attempting coexistence with existing server`
-          );
-          resolve();
-        } else {
-          reject(err);
-        }
-      });
-
-      this.httpServer.listen(this.port, () => {
-        console.log(
-          `[ChallengeResponder] HTTP challenge server started on port ${this.port}`
-        );
-        resolve();
-      });
-    });
-  }
-
-  async stop(): Promise<void> {
-    return new Promise((resolve) => {
-      if (this.httpServer) {
-        this.httpServer.close(() => {
-          this.httpServer = null;
-          console.log('[ChallengeResponder] HTTP challenge server stopped');
-          resolve();
-        });
-      } else {
-        resolve();
-      }
-    });
-  }
-
-  private handleHttpRequest(
-    req: http.IncomingMessage,
-    res: http.ServerResponse
-  ): void {
-    const url = req.url || '/';
-
-    if (!url.startsWith('/.well-known/acme-challenge/')) {
-      res.statusCode = 404;
-      res.setHeader('Content-Type', 'application/problem+json');
-      res.end(
-        JSON.stringify({
-          type: 'urn:ietf:params:acme:error:malformed',
-          detail: 'Not a valid ACME challenge path',
-          status: 404,
-        })
-      );
-      return;
+  handleHttpChallengeRequest(
+    reqUrl: string
+  ): { found: boolean; keyAuthorization?: string; domain?: string } {
+    if (!reqUrl.startsWith('/.well-known/acme-challenge/')) {
+      return { found: false };
     }
 
-    const token = url.substring('/.well-known/acme-challenge/'.length);
+    const token = reqUrl.substring('/.well-known/acme-challenge/'.length);
 
     const stored = this.httpTokens.get(token);
-
     if (!stored) {
-      res.statusCode = 404;
-      res.setHeader('Content-Type', 'application/problem+json');
-      res.end(
-        JSON.stringify({
-          type: 'urn:ietf:params:acme:error:malformed',
-          detail: 'Challenge token not found',
-          status: 404,
-        })
-      );
-      return;
+      return { found: false };
     }
 
     if (new Date() > stored.expiresAt) {
       this.httpTokens.delete(token);
-      res.statusCode = 404;
-      res.setHeader('Content-Type', 'application/problem+json');
-      res.end(
-        JSON.stringify({
-          type: 'urn:ietf:params:acme:error:malformed',
-          detail: 'Challenge token has expired',
-          status: 404,
-        })
-      );
-      return;
+      return { found: false };
     }
-
-    res.statusCode = 200;
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-store');
-    res.end(stored.keyAuthorization);
 
     console.log(
       `[ChallengeResponder] HTTP-01 challenge served for ${stored.domain}: ${token}`
     );
+
+    return { found: true, keyAuthorization: stored.keyAuthorization, domain: stored.domain };
+  }
+
+  isChallengePath(url: string): boolean {
+    return url.startsWith('/.well-known/acme-challenge/');
   }
 
   async registerHttpChallenge(
@@ -195,7 +121,7 @@ export class ChallengeResponder {
         if (records.includes(expectedValue)) {
           return;
         }
-      } catch (err) {
+      } catch {
         // DNS lookup failed, will retry
       }
       await this.sleep(checkIntervalMs);
@@ -331,10 +257,6 @@ export class ChallengeResponder {
 
   setDnsProvider(provider: DnsProvider): void {
     this.dnsProvider = provider;
-  }
-
-  getPort(): number {
-    return this.port;
   }
 
   private sleep(ms: number): Promise<void> {

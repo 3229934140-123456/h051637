@@ -20,6 +20,15 @@ export interface RenewalTask {
   completedAt?: Date;
 }
 
+function inferChallengeType(domains: string[]): ChallengeType {
+  for (const d of domains) {
+    if (d.startsWith('*.')) {
+      return 'dns-01';
+    }
+  }
+  return 'http-01';
+}
+
 export class RenewalScheduler {
   private acmeClient: AcmeClient;
   private certStore: CertificateStore;
@@ -30,7 +39,6 @@ export class RenewalScheduler {
   private tasks: Map<string, RenewalTask> = new Map();
   private isRunning: boolean = false;
   private isProcessing: boolean = false;
-  private forcedRenewals: Set<string> = new Set();
 
   constructor(
     acmeClient: AcmeClient,
@@ -87,12 +95,10 @@ export class RenewalScheduler {
   }
 
   async forceRenewal(domain: string): Promise<void> {
-    this.forcedRenewals.add(domain);
     const cert = await this.certStore.getCertificateByDomain(domain);
     if (cert) {
       await this.renewCertificate(cert);
     }
-    this.forcedRenewals.delete(domain);
   }
 
   private async checkAndRenewAll(): Promise<void> {
@@ -134,7 +140,7 @@ export class RenewalScheduler {
         }
 
         console.log(
-          `[RenewalScheduler] Renewing ${domain} (expires in ${daysUntilExpiry} days)`
+          `[RenewalScheduler] Renewing ${domain} (expires in ${daysUntilExpiry} days, challenge: ${cert.challengeType})`
         );
 
         try {
@@ -152,6 +158,7 @@ export class RenewalScheduler {
 
   private async renewCertificate(cert: StoredCertificate): Promise<void> {
     const domain = cert.domain;
+    const challengeType = cert.challengeType || inferChallengeType(cert.domains);
     const task: RenewalTask = {
       domain,
       status: 'running',
@@ -161,22 +168,22 @@ export class RenewalScheduler {
 
     this.tasks.set(domain, task);
 
+    const activeTokens: Array<{
+      type: ChallengeType;
+      token: string;
+      keyAuth: string;
+      domain: string;
+    }> = [];
+
     try {
       if (this.policy.onBeforeRenewal) {
         await this.policy.onBeforeRenewal(cert);
       }
 
-      const activeTokens: Array<{
-        type: ChallengeType;
-        token: string;
-        keyAuth: string;
-        domain: string;
-      }> = [];
-
       const result = await this.acmeClient.issueCertificate(
         {
           domains: cert.domains,
-          challengeType: this.policy.challengeType,
+          challengeType,
           dnsProvider: this.policy.dnsProvider,
         },
         async (
@@ -185,21 +192,21 @@ export class RenewalScheduler {
           challengeDomain: string
         ) => {
           await this.challengeResponder.registerChallenge(
-            this.policy.challengeType,
+            challengeType,
             challenge.token,
             keyAuthorization,
             challengeDomain
           );
           activeTokens.push({
-            type: this.policy.challengeType,
+            type: challengeType,
             token: challenge.token,
             keyAuth: keyAuthorization,
             domain: challengeDomain,
           });
 
-          if (this.policy.challengeType === 'http-01') {
+          if (challengeType === 'http-01') {
             await this.sleep(1000);
-          } else if (this.policy.challengeType === 'dns-01') {
+          } else if (challengeType === 'dns-01') {
             await this.sleep(5000);
           }
         }
@@ -233,6 +240,7 @@ export class RenewalScheduler {
         issuedAt: certInfo.issuedAt,
         expiresAt: certInfo.expiresAt,
         issuer: certInfo.issuer,
+        challengeType,
       };
 
       await this.certStore.removeCertificate(cert.serialNumber);
@@ -246,10 +254,26 @@ export class RenewalScheduler {
       }
 
       console.log(
-        `[RenewalScheduler] Successfully renewed ${domain} (serial: ${newCert.serialNumber})`
+        `[RenewalScheduler] Successfully renewed ${domain} with ${challengeType} (serial: ${newCert.serialNumber})`
       );
     } catch (err) {
       const error = err as Error;
+
+      for (const token of activeTokens) {
+        try {
+          await this.challengeResponder.unregisterChallenge(
+            token.type,
+            token.token,
+            token.keyAuth,
+            token.domain
+          );
+        } catch (cleanupErr) {
+          console.warn(
+            `[RenewalScheduler] Failed to cleanup challenge after error: ${(cleanupErr as Error).message}`
+          );
+        }
+      }
+
       task.status = 'failed';
       task.lastError = error.message;
       task.nextAttemptAt = new Date(

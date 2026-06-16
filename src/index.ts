@@ -25,13 +25,21 @@ import { CertificateStore } from './certificate-store';
 import { RenewalScheduler } from './renewal-scheduler';
 import { TLSTermination, RequestHandler } from './tls-termination';
 
+function inferChallengeType(domains: string[]): ChallengeType {
+  for (const d of domains) {
+    if (d.startsWith('*.')) {
+      return 'dns-01';
+    }
+  }
+  return 'http-01';
+}
+
 export interface AcmeTlsManagerConfig {
   acme?: Partial<AcmeClientConfig>;
   storage?: Partial<CertificateStorageConfig>;
   renewal?: Partial<RenewalConfig>;
   tls?: Partial<TLSTerminationConfig>;
   challenge?: {
-    port?: number;
     dnsProvider?: DnsProvider;
   };
   domains?: Array<{
@@ -74,7 +82,6 @@ export class AcmeTlsManager {
     await this.certStore.initialize();
 
     this.challengeResponder = new ChallengeResponder(
-      this.config.challenge?.port ?? 80,
       this.config.challenge?.dnsProvider
     );
 
@@ -93,11 +100,15 @@ export class AcmeTlsManager {
 
     await this.acmeClient.initialize();
 
-    this.tlsTermination = new TLSTermination(this.certStore, {
-      httpPort: 80,
-      httpsPort: 443,
-      ...this.config.tls,
-    });
+    this.tlsTermination = new TLSTermination(
+      this.certStore,
+      this.challengeResponder,
+      {
+        httpPort: 80,
+        httpsPort: 443,
+        ...this.config.tls,
+      }
+    );
 
     this.isInitialized = true;
 
@@ -122,14 +133,6 @@ export class AcmeTlsManager {
 
     if (this.config.domains && this.config.domains.length > 0) {
       await this.ensureCertificates();
-    }
-
-    try {
-      await this.challengeResponder!.start();
-    } catch (err) {
-      console.warn(
-        `[AcmeTlsManager] Challenge server on port ${this.config.challenge?.port ?? 80} already running or failed to start: ${(err as Error).message}`
-      );
     }
 
     await this.tlsTermination!.start();
@@ -172,7 +175,7 @@ export class AcmeTlsManager {
       try {
         await this.requestCertificate({
           domains: domainConfig.domains,
-          challengeType: domainConfig.challengeType,
+          challengeType: domainConfig.challengeType || inferChallengeType(domainConfig.domains),
           dnsProvider: this.config.challenge?.dnsProvider,
         });
       } catch (err) {
@@ -188,10 +191,7 @@ export class AcmeTlsManager {
       return;
     }
 
-    const firstChallengeType = this.config.domains[0].challengeType;
-
     const policy: RenewalPolicy = {
-      challengeType: firstChallengeType,
       dnsProvider: this.config.challenge?.dnsProvider,
       onRenewalSuccess: async (oldCert: StoredCertificate, newCert: StoredCertificate) => {
         console.log(
@@ -224,6 +224,8 @@ export class AcmeTlsManager {
       await this.initialize();
     }
 
+    const challengeType = request.challengeType || inferChallengeType(request.domains);
+
     const activeTokens: Array<{
       type: ChallengeType;
       token: string;
@@ -239,21 +241,21 @@ export class AcmeTlsManager {
           domain
         ) => {
           await this.challengeResponder!.registerChallenge(
-            request.challengeType,
+            challengeType,
             challenge.token,
             keyAuthorization,
             domain
           );
           activeTokens.push({
-            type: request.challengeType,
+            type: challengeType,
             token: challenge.token,
             keyAuth: keyAuthorization,
             domain,
           });
 
-          if (request.challengeType === 'http-01') {
+          if (challengeType === 'http-01') {
             await this.sleep(1000);
-          } else if (request.challengeType === 'dns-01') {
+          } else if (challengeType === 'dns-01') {
             await this.sleep(10000);
           }
         }
@@ -272,6 +274,7 @@ export class AcmeTlsManager {
         issuedAt: certInfo.issuedAt,
         expiresAt: certInfo.expiresAt,
         issuer: certInfo.issuer,
+        challengeType,
       };
 
       await this.certStore!.saveCertificate(storedCert);
@@ -283,11 +286,11 @@ export class AcmeTlsManager {
       }
 
       console.log(
-        `[AcmeTlsManager] Certificate issued for ${request.domains.join(', ')} (expires ${storedCert.expiresAt.toISOString()})`
+        `[AcmeTlsManager] Certificate issued for ${request.domains.join(', ')} with ${challengeType} (expires ${storedCert.expiresAt.toISOString()})`
       );
 
       return storedCert;
-    } finally {
+    } catch (err) {
       for (const token of activeTokens) {
         try {
           await this.challengeResponder!.unregisterChallenge(
@@ -296,12 +299,13 @@ export class AcmeTlsManager {
             token.keyAuth,
             token.domain
           );
-        } catch (err) {
+        } catch (cleanupErr) {
           console.warn(
-            `[AcmeTlsManager] Failed to unregister challenge: ${(err as Error).message}`
+            `[AcmeTlsManager] Failed to cleanup challenge after error: ${(cleanupErr as Error).message}`
           );
         }
       }
+      throw err;
     }
   }
 
@@ -323,10 +327,6 @@ export class AcmeTlsManager {
 
     if (this.tlsTermination) {
       await this.tlsTermination.stop();
-    }
-
-    if (this.challengeResponder) {
-      await this.challengeResponder.stop();
     }
 
     this.isStarted = false;
@@ -362,6 +362,7 @@ export class AcmeTlsManager {
       serialNumber: string;
       expiresAt: Date;
       daysUntilExpiry: number;
+      challengeType: ChallengeType;
     }>;
     renewal?: ReturnType<RenewalScheduler['getStatus']>;
     tls?: ReturnType<TLSTermination['getStats']>;
@@ -380,6 +381,7 @@ export class AcmeTlsManager {
         daysUntilExpiry: Math.ceil(
           (c.expiresAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000)
         ),
+        challengeType: c.challengeType,
       })),
       renewal: this.renewalScheduler?.getStatus(),
       tls: this.tlsTermination?.getStats(),
