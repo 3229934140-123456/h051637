@@ -593,4 +593,15 @@ export class TLSTermination {
       );
     });
   }
+
+  getDefaultDomain(): string | null {
+    return this.defaultDomain;
+  }
+
+  getConfig(): { httpPort: number; httpsPort: number } {
+    return {
+      httpPort: this.config.httpPort,
+      httpsPort: this.config.httpsPort,
+    };
+  }
 }

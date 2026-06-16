@@ -130,6 +130,75 @@ export interface DnsProvider {
 
 export type ChallengeType = 'http-01' | 'dns-01';
 
+export interface RenewalTask {
+  domain: string;
+  status: 'pending' | 'running' | 'success' | 'failed';
+  attempts: number;
+  lastError?: string;
+  lastAttemptAt?: Date;
+  nextAttemptAt?: Date;
+  completedAt?: Date;
+  failureHistory?: Array<{
+    error: string;
+    timestamp: Date;
+    attempt: number;
+  }>;
+}
+
+export interface CertificateRenewalStatus {
+  domain: string;
+  domains: string[];
+  serialNumber: string;
+  challengeType: ChallengeType;
+  issuedAt: Date;
+  expiresAt: Date;
+  daysUntilExpiry: number;
+  needsRenewal: boolean;
+  renewalTask?: RenewalTask;
+  privateKeyEncrypted: boolean;
+}
+
+export interface ManagedServiceStatus {
+  initialized: boolean;
+  started: boolean;
+  storage: {
+    totalCertificates: number;
+    managedDomains: number;
+    storageDir: string;
+  };
+  certificates: CertificateRenewalStatus[];
+  renewalScheduler: {
+    isRunning: boolean;
+    isProcessing: boolean;
+    checkIntervalMs: number;
+    renewBeforeDays: number;
+    retryDelayMs: number;
+    maxRetries: number;
+    tasks: RenewalTask[];
+  };
+  tls: {
+    httpPort: number;
+    httpsPort: number;
+    defaultDomain: string | null;
+    stats: {
+      totalTlsHandshakes: number;
+      successfulHandshakes: number;
+      failedHandshakes: number;
+      cachedContextHits: number;
+      cachedContextMisses: number;
+      httpRedirects: number;
+      challengesServed: number;
+      activeConnections: number;
+    };
+  };
+  domains: Array<{
+    domain: string;
+    certificate: CertificateRenewalStatus | null;
+    challengeType: ChallengeType;
+    autoRenewal: boolean;
+  }>;
+}
+
 export interface CertificateStorageConfig {
   storageDir: string;
   encryptPrivateKeys?: boolean;

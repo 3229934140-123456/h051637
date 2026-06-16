@@ -410,6 +410,24 @@ export class CertificateStore {
     };
   }
 
+  isPrivateKeyEncrypted(serialNumber: string): boolean {
+    try {
+      const privKeyPath = path.join(
+        this.config.storageDir,
+        'certs',
+        serialNumber,
+        'privkey.pem'
+      );
+      if (!fs.existsSync(privKeyPath)) {
+        return false;
+      }
+      const content = fs.readFileSync(privKeyPath, 'utf8');
+      return content.includes('BEGIN ENCRYPTED PRIVATE KEY');
+    } catch {
+      return false;
+    }
+  }
+
   parseCertificateInfo(certPem: string): {
     serialNumber: string;
     issuedAt: Date;

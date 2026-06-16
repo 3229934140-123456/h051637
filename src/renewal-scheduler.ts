@@ -1,3 +1,5 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import {
   AcmeChallenge,
   ChallengeType,
@@ -5,20 +7,13 @@ import {
   RenewalConfig,
   RenewalPolicy,
   StoredCertificate,
+  RenewalTask,
 } from './types';
 import { AcmeClient } from './acme-client';
 import { CertificateStore } from './certificate-store';
 import { ChallengeResponder } from './challenge-responder';
 
-export interface RenewalTask {
-  domain: string;
-  status: 'pending' | 'running' | 'success' | 'failed';
-  attempts: number;
-  lastError?: string;
-  lastAttemptAt?: Date;
-  nextAttemptAt?: Date;
-  completedAt?: Date;
-}
+export { RenewalTask };
 
 function inferChallengeType(domains: string[]): ChallengeType {
   for (const d of domains) {
@@ -27,6 +22,21 @@ function inferChallengeType(domains: string[]): ChallengeType {
     }
   }
   return 'http-01';
+}
+
+function hasWildcardDomain(domains: string[]): boolean {
+  return domains.some((d) => d.startsWith('*.'));
+}
+
+function resolveChallengeType(
+  domains: string[],
+  preferredType?: ChallengeType
+): ChallengeType {
+  const hasWildcard = hasWildcardDomain(domains);
+  if (hasWildcard) {
+    return 'dns-01';
+  }
+  return preferredType || 'http-01';
 }
 
 export class RenewalScheduler {
@@ -39,6 +49,7 @@ export class RenewalScheduler {
   private tasks: Map<string, RenewalTask> = new Map();
   private isRunning: boolean = false;
   private isProcessing: boolean = false;
+  private tasksFilePath: string;
 
   constructor(
     acmeClient: AcmeClient,
@@ -57,6 +68,10 @@ export class RenewalScheduler {
       maxRetries: config.maxRetries ?? 10,
     };
     this.policy = policy;
+    this.tasksFilePath = path.join(
+      (this.certStore as any).config.storageDir,
+      'renewal-tasks.json'
+    );
   }
 
   start(): void {
@@ -65,6 +80,8 @@ export class RenewalScheduler {
     }
 
     this.isRunning = true;
+
+    this.loadTasksFromDisk();
 
     this.checkAndRenewAll().catch((err) => {
       console.error(
@@ -81,8 +98,73 @@ export class RenewalScheduler {
     }, this.config.checkIntervalMs);
 
     console.log(
-      `[RenewalScheduler] Started (check interval: ${this.config.checkIntervalMs / 1000}s, renew before: ${this.config.renewBeforeDays} days)`
+      `[RenewalScheduler] Started (check interval: ${this.config.checkIntervalMs / 1000}s, renew before: ${this.config.renewBeforeDays} days, max retries: ${this.config.maxRetries})`
     );
+  }
+
+  private loadTasksFromDisk(): void {
+    try {
+      if (fs.existsSync(this.tasksFilePath)) {
+        const data = fs.readFileSync(this.tasksFilePath, 'utf8');
+        const parsed = JSON.parse(data);
+        if (Array.isArray(parsed.tasks)) {
+          for (const taskData of parsed.tasks) {
+            const task: RenewalTask = {
+              ...taskData,
+              lastAttemptAt: taskData.lastAttemptAt
+                ? new Date(taskData.lastAttemptAt)
+                : undefined,
+              nextAttemptAt: taskData.nextAttemptAt
+                ? new Date(taskData.nextAttemptAt)
+                : undefined,
+              completedAt: taskData.completedAt
+                ? new Date(taskData.completedAt)
+                : undefined,
+              failureHistory: (taskData.failureHistory || []).map(
+                (h: any) => ({
+                  ...h,
+                  timestamp: new Date(h.timestamp),
+                })
+              ),
+            };
+            if (task.status === 'running') {
+              task.status = 'failed';
+            }
+            this.tasks.set(task.domain, task);
+          }
+          console.log(
+            `[RenewalScheduler] Loaded ${this.tasks.size} renewal task(s) from disk`
+          );
+        }
+      }
+    } catch (err) {
+      console.warn(
+        `[RenewalScheduler] Failed to load tasks from disk: ${(err as Error).message}`
+      );
+    }
+  }
+
+  private saveTasksToDisk(): void {
+    try {
+      const tasksData = Array.from(this.tasks.values()).map((task) => ({
+        ...task,
+        failureHistory: (task.failureHistory || []).slice(-10),
+      }));
+      const data = {
+        version: 1,
+        updatedAt: new Date().toISOString(),
+        tasks: tasksData,
+      };
+      fs.writeFileSync(
+        this.tasksFilePath,
+        JSON.stringify(data, null, 2),
+        'utf8'
+      );
+    } catch (err) {
+      console.warn(
+        `[RenewalScheduler] Failed to save tasks to disk: ${(err as Error).message}`
+      );
+    }
   }
 
   stop(): void {
@@ -90,6 +172,7 @@ export class RenewalScheduler {
       clearInterval(this.timer);
       this.timer = null;
     }
+    this.saveTasksToDisk();
     this.isRunning = false;
     console.log('[RenewalScheduler] Stopped');
   }
@@ -97,6 +180,14 @@ export class RenewalScheduler {
   async forceRenewal(domain: string): Promise<void> {
     const cert = await this.certStore.getCertificateByDomain(domain);
     if (cert) {
+      const task = this.tasks.get(domain);
+      if (task) {
+        task.attempts = 0;
+        task.nextAttemptAt = new Date();
+        task.failureHistory = [];
+        this.tasks.set(domain, task);
+        this.saveTasksToDisk();
+      }
       await this.renewCertificate(cert);
     }
   }
@@ -158,15 +249,31 @@ export class RenewalScheduler {
 
   private async renewCertificate(cert: StoredCertificate): Promise<void> {
     const domain = cert.domain;
-    const challengeType = cert.challengeType || inferChallengeType(cert.domains);
+    const effectiveChallengeType = resolveChallengeType(
+      cert.domains,
+      cert.challengeType
+    );
+
+    if (
+      hasWildcardDomain(cert.domains) &&
+      cert.challengeType !== 'dns-01'
+    ) {
+      console.warn(
+        `[RenewalScheduler] Domain ${domain} has wildcard(s), forcing DNS-01 challenge (original: ${cert.challengeType})`
+      );
+    }
+
+    const existingTask = this.tasks.get(domain);
     const task: RenewalTask = {
       domain,
       status: 'running',
-      attempts: (this.tasks.get(domain)?.attempts || 0) + 1,
+      attempts: (existingTask?.attempts || 0) + 1,
       lastAttemptAt: new Date(),
+      failureHistory: existingTask?.failureHistory || [],
     };
 
     this.tasks.set(domain, task);
+    this.saveTasksToDisk();
 
     const activeTokens: Array<{
       type: ChallengeType;
@@ -183,7 +290,7 @@ export class RenewalScheduler {
       const result = await this.acmeClient.issueCertificate(
         {
           domains: cert.domains,
-          challengeType,
+          challengeType: effectiveChallengeType,
           dnsProvider: this.policy.dnsProvider,
         },
         async (
@@ -192,21 +299,21 @@ export class RenewalScheduler {
           challengeDomain: string
         ) => {
           await this.challengeResponder.registerChallenge(
-            challengeType,
+            effectiveChallengeType,
             challenge.token,
             keyAuthorization,
             challengeDomain
           );
           activeTokens.push({
-            type: challengeType,
+            type: effectiveChallengeType,
             token: challenge.token,
             keyAuth: keyAuthorization,
             domain: challengeDomain,
           });
 
-          if (challengeType === 'http-01') {
+          if (effectiveChallengeType === 'http-01') {
             await this.sleep(1000);
-          } else if (challengeType === 'dns-01') {
+          } else if (effectiveChallengeType === 'dns-01') {
             await this.sleep(5000);
           }
         }
@@ -240,21 +347,25 @@ export class RenewalScheduler {
         issuedAt: certInfo.issuedAt,
         expiresAt: certInfo.expiresAt,
         issuer: certInfo.issuer,
-        challengeType,
+        challengeType: effectiveChallengeType,
       };
 
-      await this.certStore.removeCertificate(cert.serialNumber);
       await this.certStore.saveCertificate(newCert);
-
-      task.status = 'success';
-      task.completedAt = new Date();
 
       if (this.policy.onRenewalSuccess) {
         await this.policy.onRenewalSuccess(cert, newCert);
       }
 
+      await this.certStore.removeCertificate(cert.serialNumber);
+
+      task.status = 'success';
+      task.completedAt = new Date();
+      task.lastError = undefined;
+      task.nextAttemptAt = undefined;
+      task.failureHistory = [];
+
       console.log(
-        `[RenewalScheduler] Successfully renewed ${domain} with ${challengeType} (serial: ${newCert.serialNumber})`
+        `[RenewalScheduler] Successfully renewed ${domain} with ${effectiveChallengeType} (serial: ${newCert.serialNumber})`
       );
     } catch (err) {
       const error = err as Error;
@@ -280,14 +391,27 @@ export class RenewalScheduler {
         Date.now() +
           this.config.retryDelayMs * Math.pow(2, task.attempts - 1)
       );
+      task.failureHistory = [
+        ...(task.failureHistory || []),
+        {
+          error: error.message,
+          timestamp: new Date(),
+          attempt: task.attempts,
+        },
+      ].slice(-10);
 
       if (this.policy.onRenewalError) {
         await this.policy.onRenewalError(cert, error, task.attempts);
       }
 
+      console.error(
+        `[RenewalScheduler] Renewal failed for ${domain} (attempt ${task.attempts}/${this.config.maxRetries}): ${error.message}. Next retry at ${task.nextAttemptAt.toISOString()}`
+      );
+
       throw err;
     } finally {
       this.tasks.set(domain, { ...task });
+      this.saveTasksToDisk();
     }
   }
 
@@ -308,6 +432,8 @@ export class RenewalScheduler {
     failedTasks: number;
     checkIntervalMs: number;
     renewBeforeDays: number;
+    retryDelayMs: number;
+    maxRetries: number;
   } {
     const tasks = Array.from(this.tasks.values());
     return {
@@ -319,6 +445,8 @@ export class RenewalScheduler {
       failedTasks: tasks.filter((t) => t.status === 'failed').length,
       checkIntervalMs: this.config.checkIntervalMs,
       renewBeforeDays: this.config.renewBeforeDays,
+      retryDelayMs: this.config.retryDelayMs,
+      maxRetries: this.config.maxRetries,
     };
   }
 

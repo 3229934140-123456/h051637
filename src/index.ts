@@ -17,6 +17,9 @@ import {
   RenewalPolicy,
   TLSTerminationConfig,
   StoredCertificate,
+  ManagedServiceStatus,
+  CertificateRenewalStatus,
+  RenewalTask,
 } from './types';
 
 import { AcmeClient } from './acme-client';
@@ -32,6 +35,21 @@ function inferChallengeType(domains: string[]): ChallengeType {
     }
   }
   return 'http-01';
+}
+
+function hasWildcardDomain(domains: string[]): boolean {
+  return domains.some((d) => d.startsWith('*.'));
+}
+
+function resolveChallengeType(
+  domains: string[],
+  preferredType?: ChallengeType
+): ChallengeType {
+  const hasWildcard = hasWildcardDomain(domains);
+  if (hasWildcard) {
+    return 'dns-01';
+  }
+  return preferredType || 'http-01';
 }
 
 export interface AcmeTlsManagerConfig {
@@ -175,7 +193,10 @@ export class AcmeTlsManager {
       try {
         await this.requestCertificate({
           domains: domainConfig.domains,
-          challengeType: domainConfig.challengeType || inferChallengeType(domainConfig.domains),
+          challengeType: resolveChallengeType(
+            domainConfig.domains,
+            domainConfig.challengeType
+          ),
           dnsProvider: this.config.challenge?.dnsProvider,
         });
       } catch (err) {
@@ -224,7 +245,23 @@ export class AcmeTlsManager {
       await this.initialize();
     }
 
-    const challengeType = request.challengeType || inferChallengeType(request.domains);
+    const effectiveChallengeType = resolveChallengeType(
+      request.domains,
+      request.challengeType
+    );
+
+    if (
+      hasWildcardDomain(request.domains) &&
+      request.challengeType !== 'dns-01'
+    ) {
+      console.warn(
+        `[AcmeTlsManager] Domain group ${request.domains[0]} has wildcard(s), forcing DNS-01 challenge (original: ${request.challengeType})`
+      );
+    }
+
+    const existingCert = await this.certStore!.getCertificateByDomain(
+      request.domains[0]
+    );
 
     const activeTokens: Array<{
       type: ChallengeType;
@@ -234,32 +271,51 @@ export class AcmeTlsManager {
     }> = [];
 
     try {
-      const result = await this.acmeClient!.issueCertificate(request,
+      const result = await this.acmeClient!.issueCertificate(
+        {
+          ...request,
+          challengeType: effectiveChallengeType,
+        },
         async (
           challenge,
           keyAuthorization,
           domain
         ) => {
           await this.challengeResponder!.registerChallenge(
-            challengeType,
+            effectiveChallengeType,
             challenge.token,
             keyAuthorization,
             domain
           );
           activeTokens.push({
-            type: challengeType,
+            type: effectiveChallengeType,
             token: challenge.token,
             keyAuth: keyAuthorization,
             domain,
           });
 
-          if (challengeType === 'http-01') {
+          if (effectiveChallengeType === 'http-01') {
             await this.sleep(1000);
-          } else if (challengeType === 'dns-01') {
+          } else if (effectiveChallengeType === 'dns-01') {
             await this.sleep(10000);
           }
         }
       );
+
+      for (const token of activeTokens) {
+        try {
+          await this.challengeResponder!.unregisterChallenge(
+            token.type,
+            token.token,
+            token.keyAuth,
+            token.domain
+          );
+        } catch (cleanupErr) {
+          console.warn(
+            `[AcmeTlsManager] Failed to cleanup challenge after success: ${(cleanupErr as Error).message}`
+          );
+        }
+      }
 
       const certInfo = this.certStore!.parseCertificateInfo(result.certificate);
 
@@ -274,7 +330,7 @@ export class AcmeTlsManager {
         issuedAt: certInfo.issuedAt,
         expiresAt: certInfo.expiresAt,
         issuer: certInfo.issuer,
-        challengeType,
+        challengeType: effectiveChallengeType,
       };
 
       await this.certStore!.saveCertificate(storedCert);
@@ -283,10 +339,21 @@ export class AcmeTlsManager {
         for (const domain of request.domains) {
           this.tlsTermination.invalidateContextCache(domain);
         }
+        const currentDefault = this.tlsTermination.getDefaultDomain();
+        if (currentDefault && request.domains.includes(currentDefault)) {
+          this.tlsTermination.setDefaultDomain(request.domains[0]);
+        }
+      }
+
+      if (existingCert && existingCert.serialNumber !== storedCert.serialNumber) {
+        await this.certStore!.removeCertificate(existingCert.serialNumber);
+        console.log(
+          `[AcmeTlsManager] Removed old certificate for ${storedCert.domain} (serial: ${existingCert.serialNumber})`
+        );
       }
 
       console.log(
-        `[AcmeTlsManager] Certificate issued for ${request.domains.join(', ')} with ${challengeType} (expires ${storedCert.expiresAt.toISOString()})`
+        `[AcmeTlsManager] Certificate issued for ${request.domains.join(', ')} with ${effectiveChallengeType} (expires ${storedCert.expiresAt.toISOString()})`
       );
 
       return storedCert;
@@ -385,6 +452,157 @@ export class AcmeTlsManager {
       })),
       renewal: this.renewalScheduler?.getStatus(),
       tls: this.tlsTermination?.getStats(),
+    };
+  }
+
+  async getManagedStatus(): Promise<ManagedServiceStatus> {
+    if (!this.isInitialized) {
+      await this.initialize();
+    }
+
+    const certs = await this.certStore!.getAllCertificates();
+    const now = new Date();
+    const renewalThreshold = new Date(
+      now.getTime() +
+        (this.config.renewal?.renewBeforeDays ?? 30) * 24 * 60 * 60 * 1000
+    );
+
+    const serialToCert = new Map<string, StoredCertificate>();
+    for (const cert of certs) {
+      serialToCert.set(cert.serialNumber, cert);
+    }
+
+    const managedDomainCerts = this.certStore!.getManagedDomains();
+    const domainToSerial = new Map<string, string>();
+    for (const domain of managedDomainCerts) {
+      const cert = await this.certStore!.getCertificateByDomain(domain);
+      if (cert) {
+        domainToSerial.set(domain, cert.serialNumber);
+      }
+    }
+
+    const certsWithStatus: CertificateRenewalStatus[] = [];
+    const processedSerials = new Set<string>();
+
+    for (const cert of certs) {
+      if (processedSerials.has(cert.serialNumber)) continue;
+      processedSerials.add(cert.serialNumber);
+
+      const daysUntilExpiry = Math.ceil(
+        (cert.expiresAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000)
+      );
+
+      let renewalTask: RenewalTask | undefined;
+      if (this.renewalScheduler) {
+        renewalTask = this.renewalScheduler.getTaskForDomain(cert.domain);
+      }
+
+      const privateKeyEncrypted = this.certStore!.isPrivateKeyEncrypted(
+        cert.serialNumber
+      );
+
+      certsWithStatus.push({
+        domain: cert.domain,
+        domains: cert.domains,
+        serialNumber: cert.serialNumber,
+        challengeType: cert.challengeType,
+        issuedAt: cert.issuedAt,
+        expiresAt: cert.expiresAt,
+        daysUntilExpiry,
+        needsRenewal: cert.expiresAt < renewalThreshold,
+        renewalTask,
+        privateKeyEncrypted,
+      });
+    }
+
+    const domainConfigs = this.config.domains || [];
+    const domainsStatus = domainConfigs.map((dc) => {
+      const primaryDomain = dc.domains[0];
+      const cert = certsWithStatus.find((c) => c.domain === primaryDomain) || null;
+      const effectiveChallengeType = resolveChallengeType(
+        dc.domains,
+        dc.challengeType
+      );
+      return {
+        domain: primaryDomain,
+        certificate: cert,
+        challengeType: effectiveChallengeType,
+        autoRenewal: true,
+      };
+    });
+
+    for (const cert of certsWithStatus) {
+      if (!domainConfigs.find((dc) => dc.domains[0] === cert.domain)) {
+        domainsStatus.push({
+          domain: cert.domain,
+          certificate: cert,
+          challengeType: cert.challengeType,
+          autoRenewal: false,
+        });
+      }
+    }
+
+    const tlsStats = this.tlsTermination?.getStats() || {
+      totalTlsHandshakes: 0,
+      successfulHandshakes: 0,
+      failedHandshakes: 0,
+      sniMatches: 0,
+      sniFallbackCount: 0,
+      sniMismatchCount: 0,
+      cachedContextHits: 0,
+      cachedContextMisses: 0,
+      httpRequestsForwarded: 0,
+      httpsRequestsForwarded: 0,
+      httpRedirects: 0,
+      challengesServed: 0,
+      activeConnections: 0,
+    };
+
+    const renewalSchedulerStatus = this.renewalScheduler?.getStatus() || {
+      isRunning: false,
+      isProcessing: false,
+      activeTasks: 0,
+      pendingTasks: 0,
+      completedTasks: 0,
+      failedTasks: 0,
+      checkIntervalMs: this.config.renewal?.checkIntervalMs ?? 12 * 60 * 60 * 1000,
+      renewBeforeDays: this.config.renewal?.renewBeforeDays ?? 30,
+      retryDelayMs: this.config.renewal?.retryDelayMs ?? 5 * 60 * 1000,
+      maxRetries: this.config.renewal?.maxRetries ?? 10,
+    };
+
+    const renewalTasks = this.renewalScheduler?.getRenewalTasks() || [];
+
+    return {
+      initialized: this.isInitialized,
+      started: this.isStarted,
+      storage: this.certStore!.getStorageStats(),
+      certificates: certsWithStatus,
+      renewalScheduler: {
+        isRunning: renewalSchedulerStatus.isRunning,
+        isProcessing: renewalSchedulerStatus.isProcessing,
+        checkIntervalMs: renewalSchedulerStatus.checkIntervalMs,
+        renewBeforeDays: renewalSchedulerStatus.renewBeforeDays,
+        retryDelayMs: renewalSchedulerStatus.retryDelayMs,
+        maxRetries: renewalSchedulerStatus.maxRetries,
+        tasks: renewalTasks,
+      },
+      tls: {
+        httpPort: this.tlsTermination?.getConfig().httpPort ?? 80,
+        httpsPort: this.tlsTermination?.getConfig().httpsPort ?? 443,
+        defaultDomain: this.tlsTermination?.getDefaultDomain() ?? null,
+        stats: {
+          totalTlsHandshakes: tlsStats.totalTlsHandshakes,
+          successfulHandshakes: tlsStats.successfulHandshakes,
+          failedHandshakes: tlsStats.failedHandshakes,
+          cachedContextHits: tlsStats.cachedContextHits,
+          cachedContextMisses: tlsStats.cachedContextMisses,
+          httpRedirects: tlsStats.httpRedirects,
+          challengesServed: tlsStats.challengesServed,
+          activeConnections: tlsStats.activeConnections,
+        },
+      },
+      domains: domainsStatus,
     };
   }
 
