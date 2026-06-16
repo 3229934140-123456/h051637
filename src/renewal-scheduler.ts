@@ -8,6 +8,8 @@ import {
   RenewalPolicy,
   StoredCertificate,
   RenewalTask,
+  RenewalHistoryEntry,
+  DomainRenewalHistory,
 } from './types';
 import { AcmeClient } from './acme-client';
 import { CertificateStore } from './certificate-store';
@@ -37,6 +39,17 @@ function resolveChallengeType(
     return 'dns-01';
   }
   return preferredType || 'http-01';
+}
+
+function createEmptyRenewalTask(domain: string): RenewalTask {
+  return {
+    domain,
+    status: 'pending',
+    attempts: 0,
+    consecutiveFailures: 0,
+    failureHistory: [],
+    successHistory: [],
+  };
 }
 
 export class RenewalScheduler {
@@ -109,7 +122,9 @@ export class RenewalScheduler {
         const parsed = JSON.parse(data);
         if (Array.isArray(parsed.tasks)) {
           for (const taskData of parsed.tasks) {
+            const baseTask = createEmptyRenewalTask(taskData.domain);
             const task: RenewalTask = {
+              ...baseTask,
               ...taskData,
               lastAttemptAt: taskData.lastAttemptAt
                 ? new Date(taskData.lastAttemptAt)
@@ -120,7 +135,25 @@ export class RenewalScheduler {
               completedAt: taskData.completedAt
                 ? new Date(taskData.completedAt)
                 : undefined,
+              lastSuccessAt: taskData.lastSuccessAt
+                ? new Date(taskData.lastSuccessAt)
+                : undefined,
+              lastIssuanceAt: taskData.lastIssuanceAt
+                ? new Date(taskData.lastIssuanceAt)
+                : undefined,
+              lastFailureSummary: taskData.lastFailureSummary
+                ? {
+                    ...taskData.lastFailureSummary,
+                    lastFailedAt: new Date(taskData.lastFailureSummary.lastFailedAt),
+                  }
+                : undefined,
               failureHistory: (taskData.failureHistory || []).map(
+                (h: any) => ({
+                  ...h,
+                  timestamp: new Date(h.timestamp),
+                })
+              ),
+              successHistory: (taskData.successHistory || []).map(
                 (h: any) => ({
                   ...h,
                   timestamp: new Date(h.timestamp),
@@ -149,9 +182,10 @@ export class RenewalScheduler {
       const tasksData = Array.from(this.tasks.values()).map((task) => ({
         ...task,
         failureHistory: (task.failureHistory || []).slice(-10),
+        successHistory: (task.successHistory || []).slice(-20),
       }));
       const data = {
-        version: 1,
+        version: 2,
         updatedAt: new Date().toISOString(),
         tasks: tasksData,
       };
@@ -180,14 +214,10 @@ export class RenewalScheduler {
   async forceRenewal(domain: string): Promise<void> {
     const cert = await this.certStore.getCertificateByDomain(domain);
     if (cert) {
-      const task = this.tasks.get(domain);
-      if (task) {
-        task.attempts = 0;
-        task.nextAttemptAt = new Date();
-        task.failureHistory = [];
-        this.tasks.set(domain, task);
-        this.saveTasksToDisk();
-      }
+      let task = this.tasks.get(domain) || createEmptyRenewalTask(domain);
+      task.nextAttemptAt = new Date();
+      this.tasks.set(domain, task);
+      this.saveTasksToDisk();
       await this.renewCertificate(cert);
     }
   }
@@ -263,13 +293,14 @@ export class RenewalScheduler {
       );
     }
 
-    const existingTask = this.tasks.get(domain);
+    const existingTask = this.tasks.get(domain) || createEmptyRenewalTask(domain);
     const task: RenewalTask = {
-      domain,
+      ...existingTask,
       status: 'running',
-      attempts: (existingTask?.attempts || 0) + 1,
+      attempts: existingTask.attempts + 1,
       lastAttemptAt: new Date(),
-      failureHistory: existingTask?.failureHistory || [],
+      currentPhase: 'ordering',
+      phaseDetail: 'Creating ACME order',
     };
 
     this.tasks.set(domain, task);
@@ -284,8 +315,17 @@ export class RenewalScheduler {
 
     try {
       if (this.policy.onBeforeRenewal) {
+        task.currentPhase = 'checking';
+        task.phaseDetail = 'Running onBeforeRenewal hook';
+        this.tasks.set(domain, { ...task });
+        this.saveTasksToDisk();
         await this.policy.onBeforeRenewal(cert);
       }
+
+      task.currentPhase = 'challenging';
+      task.phaseDetail = `Setting up ${effectiveChallengeType} challenge`;
+      this.tasks.set(domain, { ...task });
+      this.saveTasksToDisk();
 
       const result = await this.acmeClient.issueCertificate(
         {
@@ -319,6 +359,11 @@ export class RenewalScheduler {
         }
       );
 
+      task.currentPhase = 'finalizing';
+      task.phaseDetail = 'Finalizing order and downloading certificate';
+      this.tasks.set(domain, { ...task });
+      this.saveTasksToDisk();
+
       for (const token of activeTokens) {
         try {
           await this.challengeResponder.unregisterChallenge(
@@ -335,6 +380,10 @@ export class RenewalScheduler {
       }
 
       const certInfo = this.certStore.parseCertificateInfo(result.certificate);
+      const now = new Date();
+      const daysUntilExpiry = Math.ceil(
+        (certInfo.expiresAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000)
+      );
 
       const newCert: StoredCertificate = {
         domain: cert.domains[0],
@@ -350,19 +399,56 @@ export class RenewalScheduler {
         challengeType: effectiveChallengeType,
       };
 
+      task.currentPhase = 'installing';
+      task.phaseDetail = 'Installing new certificate';
+      this.tasks.set(domain, { ...task });
+      this.saveTasksToDisk();
+
       await this.certStore.saveCertificate(newCert);
 
       if (this.policy.onRenewalSuccess) {
         await this.policy.onRenewalSuccess(cert, newCert);
       }
 
+      task.currentPhase = 'cleaning';
+      task.phaseDetail = 'Removing old certificate';
+      this.tasks.set(domain, { ...task });
+      this.saveTasksToDisk();
+
       await this.certStore.removeCertificate(cert.serialNumber);
 
+      const currentConsecutiveFailures = existingTask.consecutiveFailures;
+      const currentFailureHistory = existingTask.failureHistory;
       task.status = 'success';
-      task.completedAt = new Date();
+      task.completedAt = now;
       task.lastError = undefined;
       task.nextAttemptAt = undefined;
-      task.failureHistory = [];
+      task.lastSuccessAt = now;
+      task.lastIssuedSerial = certInfo.serialNumber;
+      task.lastIssuanceAt = certInfo.issuedAt;
+      task.consecutiveFailures = 0;
+
+      if (currentConsecutiveFailures > 0 && currentFailureHistory.length > 0) {
+        const lastFailure = currentFailureHistory[currentFailureHistory.length - 1];
+        task.lastFailureSummary = {
+          beforeSuccessCount: currentConsecutiveFailures,
+          lastError: lastFailure.error,
+          lastFailedAt: lastFailure.timestamp,
+          totalFailuresBeforeSuccess: currentFailureHistory.length,
+        };
+      }
+
+      task.successHistory = [
+        ...existingTask.successHistory,
+        {
+          timestamp: now,
+          serialNumber: certInfo.serialNumber,
+          daysUntilExpiry,
+        },
+      ].slice(-20);
+
+      task.currentPhase = 'idle';
+      task.phaseDetail = undefined;
 
       console.log(
         `[RenewalScheduler] Successfully renewed ${domain} with ${effectiveChallengeType} (serial: ${newCert.serialNumber})`
@@ -391,21 +477,24 @@ export class RenewalScheduler {
         Date.now() +
           this.config.retryDelayMs * Math.pow(2, task.attempts - 1)
       );
+      task.consecutiveFailures = existingTask.consecutiveFailures + 1;
       task.failureHistory = [
-        ...(task.failureHistory || []),
+        ...existingTask.failureHistory,
         {
           error: error.message,
           timestamp: new Date(),
           attempt: task.attempts,
         },
       ].slice(-10);
+      task.currentPhase = 'idle';
+      task.phaseDetail = error.message;
 
       if (this.policy.onRenewalError) {
         await this.policy.onRenewalError(cert, error, task.attempts);
       }
 
       console.error(
-        `[RenewalScheduler] Renewal failed for ${domain} (attempt ${task.attempts}/${this.config.maxRetries}): ${error.message}. Next retry at ${task.nextAttemptAt.toISOString()}`
+        `[RenewalScheduler] Renewal failed for ${domain} (attempt ${task.attempts}/${this.config.maxRetries}, consecutive: ${task.consecutiveFailures}): ${error.message}. Next retry at ${task.nextAttemptAt.toISOString()}`
       );
 
       throw err;
@@ -421,6 +510,105 @@ export class RenewalScheduler {
 
   getTaskForDomain(domain: string): RenewalTask | undefined {
     return this.tasks.get(domain);
+  }
+
+  getOrCreateTaskForDomain(domain: string): RenewalTask {
+    let task = this.tasks.get(domain);
+    if (!task) {
+      task = createEmptyRenewalTask(domain);
+      this.tasks.set(domain, task);
+      this.saveTasksToDisk();
+    }
+    return task;
+  }
+
+  updateTaskPhase(
+    domain: string,
+    phase: RenewalTask['currentPhase'],
+    detail?: string
+  ): void {
+    const task = this.tasks.get(domain);
+    if (task) {
+      task.currentPhase = phase;
+      task.phaseDetail = detail;
+      this.tasks.set(domain, { ...task });
+    }
+  }
+
+  getRenewalHistoryForDomain(
+    domain: string,
+    limit: number = 20
+  ): DomainRenewalHistory {
+    const task = this.tasks.get(domain) || createEmptyRenewalTask(domain);
+    const entries: RenewalHistoryEntry[] = [];
+
+    for (const s of task.successHistory) {
+      entries.push({
+        domain,
+        timestamp: s.timestamp,
+        type: 'success',
+        attempt: 1,
+        serialNumber: s.serialNumber,
+        daysUntilExpiry: s.daysUntilExpiry,
+      });
+    }
+
+    for (const f of task.failureHistory) {
+      entries.push({
+        domain,
+        timestamp: f.timestamp,
+        type: 'failure',
+        attempt: f.attempt,
+        error: f.error,
+      });
+    }
+
+    entries.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+    const trimmed = entries.slice(0, limit);
+
+    const successEntries = trimmed.filter((e) => e.type === 'success');
+    const failureEntries = trimmed.filter((e) => e.type === 'failure');
+
+    return {
+      domain,
+      entries: trimmed,
+      summary: {
+        totalSuccesses: task.successHistory.length,
+        totalFailures: task.failureHistory.length,
+        consecutiveFailures: task.consecutiveFailures,
+        lastSuccessAt:
+          successEntries.length > 0 ? successEntries[0].timestamp : undefined,
+        lastFailureAt:
+          failureEntries.length > 0 ? failureEntries[0].timestamp : undefined,
+        lastFailureError:
+          failureEntries.length > 0 ? failureEntries[0].error : undefined,
+      },
+    };
+  }
+
+  getConsecutiveFailures(): Array<{
+    domain: string;
+    consecutiveFailures: number;
+    lastError: string;
+    nextAttemptAt?: Date;
+  }> {
+    const result: Array<{
+      domain: string;
+      consecutiveFailures: number;
+      lastError: string;
+      nextAttemptAt?: Date;
+    }> = [];
+    for (const task of this.tasks.values()) {
+      if (task.consecutiveFailures > 0) {
+        result.push({
+          domain: task.domain,
+          consecutiveFailures: task.consecutiveFailures,
+          lastError: task.lastError || 'Unknown error',
+          nextAttemptAt: task.nextAttemptAt,
+        });
+      }
+    }
+    return result.sort((a, b) => b.consecutiveFailures - a.consecutiveFailures);
   }
 
   getStatus(): {

@@ -20,6 +20,11 @@ import {
   ManagedServiceStatus,
   CertificateRenewalStatus,
   RenewalTask,
+  DomainLifecycleStatus,
+  HealthCheckResult,
+  DomainRenewalHistory,
+  DomainOperationRecord,
+  OperationType,
 } from './types';
 
 import { AcmeClient } from './acme-client';
@@ -78,6 +83,9 @@ export class AcmeTlsManager {
   private tlsTermination: TLSTermination | null = null;
   private isInitialized: boolean = false;
   private isStarted: boolean = false;
+  private startTime: number = 0;
+  private operationLog: Map<string, DomainOperationRecord[]> = new Map();
+  private operationLogLimit: number = 5;
 
   constructor(config: AcmeTlsManagerConfig = {}) {
     this.config = config;
@@ -158,8 +166,60 @@ export class AcmeTlsManager {
     this.setupRenewalScheduler();
 
     this.isStarted = true;
+    this.startTime = Date.now();
 
     console.log('[AcmeTlsManager] Started successfully');
+  }
+
+  private recordOperation(
+    primaryDomain: string,
+    type: OperationType,
+    update: Partial<DomainOperationRecord>
+  ): void {
+    let logs = this.operationLog.get(primaryDomain);
+    if (!logs) {
+      logs = [];
+      this.operationLog.set(primaryDomain, logs);
+    }
+
+    if (update.status === 'running') {
+      const record: DomainOperationRecord = {
+        type,
+        startedAt: new Date(),
+        status: 'running',
+        challengeType: update.challengeType || 'http-01',
+        phase: update.phase,
+      };
+      logs.unshift(record);
+    } else {
+      const current = logs.find((r) => r.status === 'running' && r.type === type);
+      if (current) {
+        Object.assign(current, {
+          ...update,
+          completedAt: new Date(),
+        });
+      } else {
+        const record: DomainOperationRecord = {
+          type,
+          startedAt: new Date(Date.now() - 1),
+          completedAt: new Date(),
+          status: update.status || 'success',
+          challengeType: update.challengeType || 'http-01',
+          error: update.error,
+          serialNumber: update.serialNumber,
+          phase: update.phase,
+        };
+        logs.unshift(record);
+      }
+    }
+
+    if (logs.length > this.operationLogLimit) {
+      logs.length = this.operationLogLimit;
+    }
+  }
+
+  private getLatestOperations(primaryDomain: string): DomainOperationRecord[] {
+    return this.operationLog.get(primaryDomain) || [];
   }
 
   private async ensureCertificates(): Promise<void> {
@@ -191,6 +251,15 @@ export class AcmeTlsManager {
       }
 
       try {
+        this.recordOperation(primaryDomain, 'initial-issue', {
+          status: 'running',
+          challengeType: resolveChallengeType(
+            domainConfig.domains,
+            domainConfig.challengeType
+          ),
+          phase: 'ordering',
+        });
+
         await this.requestCertificate({
           domains: domainConfig.domains,
           challengeType: resolveChallengeType(
@@ -200,6 +269,15 @@ export class AcmeTlsManager {
           dnsProvider: this.config.challenge?.dnsProvider,
         });
       } catch (err) {
+        const error = err as Error;
+        this.recordOperation(primaryDomain, 'initial-issue', {
+          status: 'failed',
+          error: error.message,
+          challengeType: resolveChallengeType(
+            domainConfig.domains,
+            domainConfig.challengeType
+          ),
+        });
         console.error(
           `[AcmeTlsManager] Failed to get certificate for ${primaryDomain}: ${(err as Error).message}`
         );
@@ -218,12 +296,23 @@ export class AcmeTlsManager {
         console.log(
           `[AcmeTlsManager] Renewal succeeded: ${oldCert.domain} (${oldCert.serialNumber} -> ${newCert.serialNumber})`
         );
-        this.tlsTermination!.invalidateContextCache(oldCert.domain);
+        this.tlsTermination!.invalidateContextCacheForDomains(newCert.domains);
+        this.recordOperation(newCert.domain, 'renewal', {
+          status: 'success',
+          serialNumber: newCert.serialNumber,
+          challengeType: newCert.challengeType,
+          phase: 'idle',
+        });
       },
       onRenewalError: async (cert: StoredCertificate, error: Error, attempt: number) => {
         console.error(
           `[AcmeTlsManager] Renewal attempt ${attempt} failed for ${cert.domain}: ${error.message}`
         );
+        this.recordOperation(cert.domain, 'renewal', {
+          status: 'failed',
+          error: error.message,
+          challengeType: cert.challengeType,
+        });
       },
     };
 
@@ -270,7 +359,16 @@ export class AcmeTlsManager {
       domain: string;
     }> = [];
 
+    const primaryDomain = request.domains[0];
+    const opType: OperationType = existingCert ? 'manual-request' : 'initial-issue';
+
     try {
+      this.recordOperation(primaryDomain, opType, {
+        status: 'running',
+        challengeType: effectiveChallengeType,
+        phase: 'ordering',
+      });
+
       const result = await this.acmeClient!.issueCertificate(
         {
           ...request,
@@ -336,28 +434,37 @@ export class AcmeTlsManager {
       await this.certStore!.saveCertificate(storedCert);
 
       if (this.tlsTermination) {
-        for (const domain of request.domains) {
-          this.tlsTermination.invalidateContextCache(domain);
-        }
+        this.tlsTermination.invalidateContextCacheForDomains(request.domains);
         const currentDefault = this.tlsTermination.getDefaultDomain();
         if (currentDefault && request.domains.includes(currentDefault)) {
           this.tlsTermination.setDefaultDomain(request.domains[0]);
         }
       }
 
+      let oldCertRemoved = false;
       if (existingCert && existingCert.serialNumber !== storedCert.serialNumber) {
         await this.certStore!.removeCertificate(existingCert.serialNumber);
+        oldCertRemoved = true;
         console.log(
           `[AcmeTlsManager] Removed old certificate for ${storedCert.domain} (serial: ${existingCert.serialNumber})`
         );
       }
 
+      this.recordOperation(primaryDomain, opType, {
+        status: 'success',
+        serialNumber: storedCert.serialNumber,
+        challengeType: effectiveChallengeType,
+        phase: 'idle',
+      });
+
       console.log(
-        `[AcmeTlsManager] Certificate issued for ${request.domains.join(', ')} with ${effectiveChallengeType} (expires ${storedCert.expiresAt.toISOString()})`
+        `[AcmeTlsManager] Certificate issued for ${request.domains.join(', ')} with ${effectiveChallengeType} (expires ${storedCert.expiresAt.toISOString()}, old cert removed: ${oldCertRemoved})`
       );
 
       return storedCert;
     } catch (err) {
+      const error = err as Error;
+
       for (const token of activeTokens) {
         try {
           await this.challengeResponder!.unregisterChallenge(
@@ -372,6 +479,13 @@ export class AcmeTlsManager {
           );
         }
       }
+
+      this.recordOperation(primaryDomain, opType, {
+        status: 'failed',
+        error: error.message,
+        challengeType: effectiveChallengeType,
+      });
+
       throw err;
     }
   }
@@ -380,7 +494,27 @@ export class AcmeTlsManager {
     if (!this.renewalScheduler) {
       throw new Error('Renewal scheduler not started');
     }
-    await this.renewalScheduler.forceRenewal(domain);
+    this.recordOperation(domain, 'force-renewal', {
+      status: 'running',
+      challengeType: 'dns-01',
+      phase: 'checking',
+    });
+    try {
+      await this.renewalScheduler.forceRenewal(domain);
+      this.recordOperation(domain, 'force-renewal', {
+        status: 'success',
+        challengeType: 'dns-01',
+        phase: 'idle',
+      });
+    } catch (err) {
+      const error = err as Error;
+      this.recordOperation(domain, 'force-renewal', {
+        status: 'failed',
+        error: error.message,
+        challengeType: 'dns-01',
+      });
+      throw err;
+    }
   }
 
   async stop(): Promise<void> {
@@ -467,20 +601,6 @@ export class AcmeTlsManager {
         (this.config.renewal?.renewBeforeDays ?? 30) * 24 * 60 * 60 * 1000
     );
 
-    const serialToCert = new Map<string, StoredCertificate>();
-    for (const cert of certs) {
-      serialToCert.set(cert.serialNumber, cert);
-    }
-
-    const managedDomainCerts = this.certStore!.getManagedDomains();
-    const domainToSerial = new Map<string, string>();
-    for (const domain of managedDomainCerts) {
-      const cert = await this.certStore!.getCertificateByDomain(domain);
-      if (cert) {
-        domainToSerial.set(domain, cert.serialNumber);
-      }
-    }
-
     const certsWithStatus: CertificateRenewalStatus[] = [];
     const processedSerials = new Set<string>();
 
@@ -516,28 +636,154 @@ export class AcmeTlsManager {
     }
 
     const domainConfigs = this.config.domains || [];
-    const domainsStatus = domainConfigs.map((dc) => {
+    const primaryToCert = new Map<string, CertificateRenewalStatus>();
+    for (const cs of certsWithStatus) {
+      primaryToCert.set(cs.domain, cs);
+    }
+
+    const domainsStatus: DomainLifecycleStatus[] = domainConfigs.map((dc) => {
       const primaryDomain = dc.domains[0];
-      const cert = certsWithStatus.find((c) => c.domain === primaryDomain) || null;
+      const hasWildcard = hasWildcardDomain(dc.domains);
       const effectiveChallengeType = resolveChallengeType(
         dc.domains,
         dc.challengeType
       );
+      const certStatus = primaryToCert.get(primaryDomain);
+      const latestOps = this.getLatestOperations(primaryDomain);
+      const renewalTask = this.renewalScheduler?.getTaskForDomain(primaryDomain);
+
+      const lastOperation: DomainLifecycleStatus['lastOperation'] = {};
+      const lastOp = latestOps[0];
+      if (lastOp) {
+        lastOperation.type = lastOp.type;
+        lastOperation.status = lastOp.status;
+        lastOperation.startedAt = lastOp.startedAt;
+        lastOperation.completedAt = lastOp.completedAt;
+        lastOperation.error = lastOp.error;
+        lastOperation.serialNumber = lastOp.serialNumber;
+      }
+
+      let lastSuccessfulIssue: DomainLifecycleStatus['lastSuccessfulIssue'] = undefined;
+      const lastSuccess = latestOps.find((o) => o.status === 'success');
+      if (lastSuccess && lastSuccess.serialNumber && certStatus) {
+        lastSuccessfulIssue = {
+          at: lastSuccess.completedAt || lastSuccess.startedAt,
+          serialNumber: lastSuccess.serialNumber,
+          expiresAt: certStatus.expiresAt,
+        };
+      }
+
+      let lastRenewalAttempt: DomainLifecycleStatus['lastRenewalAttempt'] = undefined;
+      const lastRenewal = latestOps.find((o) => o.type === 'renewal');
+      if (lastRenewal) {
+        lastRenewalAttempt = {
+          at: lastRenewal.completedAt || lastRenewal.startedAt,
+          success: lastRenewal.status === 'success',
+          error: lastRenewal.error,
+        };
+      }
+
+      let lastFailure: DomainLifecycleStatus['lastFailure'] = undefined;
+      const lastFailed = latestOps.find((o) => o.status === 'failed');
+      if (lastFailed) {
+        lastFailure = {
+          at: lastFailed.completedAt || lastFailed.startedAt,
+          error: lastFailed.error || 'Unknown error',
+          operationType: lastFailed.type,
+          phase: lastFailed.phase,
+        };
+      }
+
+      const consecutiveRenewalFailures = renewalTask?.consecutiveFailures || 0;
+      const totalRenewalAttempts =
+        (renewalTask?.successHistory.length || 0) +
+        (renewalTask?.failureHistory.length || 0);
+      const successfulRenewals = renewalTask?.successHistory.length || 0;
+
+      let currentState: DomainLifecycleStatus['currentState'];
+      let stateReason: string | undefined;
+
+      if (!certStatus) {
+        const running = latestOps.find((o) => o.status === 'running');
+        const failed = latestOps.find((o) => o.status === 'failed');
+        if (running) {
+          currentState = 'issuing';
+          stateReason = `Issuing in progress at phase: ${running.phase || 'unknown'}`;
+        } else if (failed) {
+          currentState = 'issuing-failed';
+          stateReason = `Last issue failed: ${failed.error || 'unknown error'}`;
+        } else {
+          currentState = 'unissued';
+          stateReason = 'Certificate has not been issued yet';
+        }
+      } else if (
+        renewalTask?.status === 'running' ||
+        (lastOperation?.status === 'running' && lastOperation?.type === 'renewal')
+      ) {
+        currentState = 'renewing';
+        stateReason = `Renewal in progress at phase: ${renewalTask?.currentPhase || lastOperation?.type || 'unknown'}`;
+      } else if (certStatus.daysUntilExpiry <= 0) {
+        currentState = 'expired';
+        stateReason = `Certificate expired ${Math.abs(certStatus.daysUntilExpiry)} day(s) ago`;
+      } else if (certStatus.needsRenewal) {
+        if (consecutiveRenewalFailures > 0) {
+          currentState = 'renewal-failed';
+          stateReason = `Renewal failed ${consecutiveRenewalFailures} time(s). Last error: ${renewalTask?.lastError || 'unknown'}`;
+        } else {
+          currentState = 'expiring-soon';
+          stateReason = `Certificate will expire in ${certStatus.daysUntilExpiry} day(s), needs renewal`;
+        }
+      } else {
+        currentState = 'active';
+        stateReason = `Certificate valid for ${certStatus.daysUntilExpiry} more day(s)`;
+      }
+
       return {
         domain: primaryDomain,
-        certificate: cert,
-        challengeType: effectiveChallengeType,
+        configuredDomains: dc.domains,
+        effectiveChallengeType,
+        hasWildcard,
         autoRenewal: true,
+        lastOperation,
+        lastSuccessfulIssue,
+        lastRenewalAttempt,
+        lastFailure,
+        nextScheduledRenewalAt: renewalTask?.nextAttemptAt,
+        consecutiveRenewalFailures,
+        totalRenewalAttempts,
+        successfulRenewals,
+        currentState,
+        stateReason,
+        latestOperations: latestOps,
+        renewalTask,
       };
     });
 
-    for (const cert of certsWithStatus) {
-      if (!domainConfigs.find((dc) => dc.domains[0] === cert.domain)) {
+    for (const cs of certsWithStatus) {
+      if (!domainConfigs.find((dc) => dc.domains[0] === cs.domain)) {
+        const renewalTask = this.renewalScheduler?.getTaskForDomain(cs.domain);
         domainsStatus.push({
-          domain: cert.domain,
-          certificate: cert,
-          challengeType: cert.challengeType,
+          domain: cs.domain,
+          configuredDomains: cs.domains,
+          effectiveChallengeType: cs.challengeType,
+          hasWildcard: hasWildcardDomain(cs.domains),
           autoRenewal: false,
+          lastOperation: {},
+          lastSuccessfulIssue: {
+            at: cs.issuedAt,
+            serialNumber: cs.serialNumber,
+            expiresAt: cs.expiresAt,
+          },
+          nextScheduledRenewalAt: renewalTask?.nextAttemptAt,
+          consecutiveRenewalFailures: renewalTask?.consecutiveFailures || 0,
+          totalRenewalAttempts:
+            (renewalTask?.successHistory.length || 0) +
+            (renewalTask?.failureHistory.length || 0),
+          successfulRenewals: renewalTask?.successHistory.length || 0,
+          currentState: cs.daysUntilExpiry <= 0 ? 'expired' : 'active',
+          stateReason: `Auto-renewal disabled. Valid for ${cs.daysUntilExpiry} day(s)`,
+          latestOperations: this.getLatestOperations(cs.domain),
+          renewalTask,
         });
       }
     }
@@ -604,6 +850,227 @@ export class AcmeTlsManager {
       },
       domains: domainsStatus,
     };
+  }
+
+  async getHealthCheck(
+    options: {
+      consecutiveFailureThreshold?: number;
+      minDaysRemaining?: number;
+    } = {}
+  ): Promise<HealthCheckResult> {
+    if (!this.isInitialized) {
+      await this.initialize();
+    }
+
+    const now = new Date();
+    const uptimeMs = this.startTime > 0 ? now.getTime() - this.startTime : 0;
+    const warnings: string[] = [];
+    const criticals: string[] = [];
+    const summary: string[] = [];
+
+    const managerHealthy = this.isInitialized && this.isStarted;
+    if (!this.isInitialized) {
+      criticals.push('Manager not initialized');
+    } else if (!this.isStarted) {
+      warnings.push('Manager initialized but not started');
+    } else {
+      summary.push('Manager initialized and started');
+    }
+
+    let httpPort = this.config.tls?.httpPort ?? 80;
+    let httpsPort = this.config.tls?.httpsPort ?? 443;
+    if (this.tlsTermination) {
+      const cfg = this.tlsTermination.getConfig();
+      httpPort = cfg.httpPort;
+      httpsPort = cfg.httpsPort;
+    }
+
+    const httpChallengeHealthy = this.tlsTermination
+      ? (this.tlsTermination as any).httpServer?.listening ?? false
+      : false;
+    const httpChallenge: HealthCheckResult['components']['httpChallenge'] = {
+      healthy: httpChallengeHealthy,
+      port: httpPort,
+      available: httpChallengeHealthy,
+      detail: httpChallengeHealthy
+        ? `HTTP challenge server listening on port ${httpPort}`
+        : `HTTP challenge server not listening on port ${httpPort}`,
+    };
+    if (httpChallengeHealthy) {
+      summary.push(`HTTP challenge server available on port ${httpPort}`);
+    } else {
+      criticals.push(`HTTP challenge server unavailable on port ${httpPort}`);
+    }
+
+    let defaultDomain: string | null = null;
+    let hasDefaultCert = false;
+    let defaultCertExpiry: Date | undefined;
+    let defaultCertDays: number | undefined;
+
+    if (this.tlsTermination) {
+      defaultDomain = this.tlsTermination.getDefaultDomain();
+      if (defaultDomain) {
+        const cert = await this.certStore!.getCertificateByDomain(defaultDomain);
+        if (cert) {
+          hasDefaultCert = true;
+          defaultCertExpiry = cert.expiresAt;
+          defaultCertDays = Math.ceil(
+            (cert.expiresAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000)
+          );
+        }
+      }
+    }
+
+    const minDays = options.minDaysRemaining ?? 14;
+    const defaultCertHealthy =
+      hasDefaultCert && (defaultCertDays ?? 0) > minDays;
+
+    const httpsDefaultCert: HealthCheckResult['components']['httpsDefaultCert'] = {
+      healthy: defaultCertHealthy,
+      port: httpsPort,
+      hasDefaultCert,
+      defaultDomain,
+      expiresAt: defaultCertExpiry,
+      daysUntilExpiry: defaultCertDays,
+      detail: hasDefaultCert
+        ? defaultCertDays && defaultCertDays > minDays
+          ? `Default certificate for ${defaultDomain} valid for ${defaultCertDays} day(s)`
+          : `Default certificate for ${defaultDomain} expires in ${defaultCertDays} day(s) (threshold: ${minDays})`
+        : defaultDomain
+          ? `No certificate found for default domain ${defaultDomain}`
+          : 'No default domain configured',
+    };
+    if (!hasDefaultCert) {
+      criticals.push(`No default HTTPS certificate available`);
+    } else if (defaultCertDays !== undefined && defaultCertDays <= minDays) {
+      warnings.push(`Default certificate expiring soon: ${defaultCertDays} day(s) left`);
+    } else {
+      summary.push(`Default HTTPS certificate OK for ${defaultDomain}`);
+    }
+
+    const consecutiveThreshold = options.consecutiveFailureThreshold ?? 3;
+    const consecutiveFailures = this.renewalScheduler
+      ? this.renewalScheduler.getConsecutiveFailures()
+      : [];
+    const anyConsecutiveFailures =
+      consecutiveFailures.some((f) => f.consecutiveFailures >= consecutiveThreshold);
+    const failedDomains = consecutiveFailures
+      .filter((f) => f.consecutiveFailures >= 2)
+      .map((f) => f.domain);
+    const schedulerRunning = this.renewalScheduler?.getStatus().isRunning ?? false;
+
+    const maxConsecutive =
+      consecutiveFailures.length > 0 ? consecutiveFailures[0].consecutiveFailures : 0;
+
+    const renewalScheduler: HealthCheckResult['components']['renewalScheduler'] = {
+      healthy: schedulerRunning && !anyConsecutiveFailures,
+      isRunning: schedulerRunning,
+      anyConsecutiveFailures,
+      maxConsecutiveFailures: maxConsecutive,
+      failedDomains,
+      detail: schedulerRunning
+        ? anyConsecutiveFailures
+          ? `${consecutiveFailures.filter((f) => f.consecutiveFailures >= consecutiveThreshold).length} domain(s) have >= ${consecutiveThreshold} consecutive renewal failures`
+          : failedDomains.length > 0
+            ? `${failedDomains.length} domain(s) with 2+ consecutive failures (under threshold ${consecutiveThreshold})`
+            : 'Scheduler running, no excessive consecutive failures'
+        : 'Renewal scheduler not running',
+    };
+
+    if (!schedulerRunning) {
+      criticals.push('Renewal scheduler not running');
+    } else if (anyConsecutiveFailures) {
+      criticals.push(`Renewal consecutive failures detected (>= ${consecutiveThreshold}): ${failedDomains.join(', ')}`);
+    } else if (failedDomains.length > 0) {
+      warnings.push(`Some domains have consecutive renewal failures: ${failedDomains.join(', ')}`);
+    } else {
+      summary.push('Renewal scheduler healthy');
+    }
+
+    let storageWritable = false;
+    const storageDir = (this.certStore as any).config.storageDir || './acme-data';
+    try {
+      const testFile = require('path').join(storageDir, '.healthcheck.tmp');
+      require('fs').writeFileSync(testFile, String(Date.now()));
+      require('fs').unlinkSync(testFile);
+      storageWritable = true;
+    } catch {
+      storageWritable = false;
+    }
+    const storageStats = this.certStore!.getStorageStats();
+    const storageHealthy = storageWritable;
+
+    const storage: HealthCheckResult['components']['storage'] = {
+      healthy: storageHealthy,
+      storageDir,
+      writable: storageWritable,
+      totalCertificates: storageStats.totalCertificates,
+      detail: storageWritable
+        ? `Storage OK at ${storageDir}: ${storageStats.totalCertificates} cert(s) managing ${storageStats.managedDomains} domain(s)`
+        : `Storage directory not writable at ${storageDir}`,
+    };
+    if (storageWritable) {
+      summary.push(`Storage writable at ${storageDir}`);
+    } else {
+      criticals.push(`Storage directory not writable at ${storageDir}`);
+    }
+
+    const healthy =
+      managerHealthy &&
+      httpChallengeHealthy &&
+      defaultCertHealthy &&
+      renewalScheduler.healthy &&
+      storageHealthy;
+
+    return {
+      healthy,
+      timestamp: now,
+      uptimeMs,
+      components: {
+        manager: {
+          healthy: managerHealthy,
+          initialized: this.isInitialized,
+          started: this.isStarted,
+        },
+        httpChallenge,
+        httpsDefaultCert,
+        renewalScheduler,
+        storage,
+      },
+      summary,
+      warnings,
+      criticals,
+    };
+  }
+
+  getRenewalHistory(
+    domain: string,
+    limit: number = 20
+  ): DomainRenewalHistory {
+    if (!this.renewalScheduler) {
+      return {
+        domain,
+        entries: [],
+        summary: {
+          totalSuccesses: 0,
+          totalFailures: 0,
+          consecutiveFailures: 0,
+        },
+      };
+    }
+    return this.renewalScheduler.getRenewalHistoryForDomain(domain, limit);
+  }
+
+  getAllConsecutiveFailures(): Array<{
+    domain: string;
+    consecutiveFailures: number;
+    lastError: string;
+    nextAttemptAt?: Date;
+  }> {
+    if (!this.renewalScheduler) {
+      return [];
+    }
+    return this.renewalScheduler.getConsecutiveFailures();
   }
 
   private sleep(ms: number): Promise<void> {

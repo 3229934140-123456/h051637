@@ -429,10 +429,33 @@ export class TLSTermination {
 
   invalidateContextCache(domain?: string): void {
     if (domain) {
-      this.contextCache.delete(domain.toLowerCase());
-      this.contextCacheMeta.delete(domain.toLowerCase());
+      const normalized = domain.toLowerCase();
+      this.contextCache.delete(normalized);
+      this.contextCacheMeta.delete(normalized);
+
+      if (normalized.startsWith('*.')) {
+        const suffix = normalized.slice(1);
+        const keysToDelete: string[] = [];
+        for (const cachedKey of this.contextCache.keys()) {
+          if (cachedKey.endsWith(suffix)) {
+            keysToDelete.push(cachedKey);
+          }
+        }
+        for (const k of keysToDelete) {
+          this.contextCache.delete(k);
+          this.contextCacheMeta.delete(k);
+        }
+      }
+
+      const parts = normalized.split('.');
+      if (parts.length >= 2) {
+        const wildcardKey = `*.${parts.slice(1).join('.')}`;
+        this.contextCache.delete(wildcardKey);
+        this.contextCacheMeta.delete(wildcardKey);
+      }
+
       console.log(
-        `[TLSTermination] Invalidated TLS context cache for ${domain}`
+        `[TLSTermination] Invalidated TLS context cache for ${domain} (including wildcard variants)`
       );
     } else {
       this.contextCache.clear();
@@ -444,6 +467,20 @@ export class TLSTermination {
       });
       console.log('[TLSTermination] Invalidated entire TLS context cache');
     }
+  }
+
+  invalidateContextCacheForDomains(domains: string[]): number {
+    let invalidated = 0;
+    for (const domain of domains) {
+      const before = this.contextCache.size;
+      this.invalidateContextCache(domain);
+      invalidated += before - this.contextCache.size;
+    }
+    return invalidated;
+  }
+
+  getCachedDomains(): string[] {
+    return Array.from(this.contextCache.keys());
   }
 
   private startCertCacheWatcher(): void {

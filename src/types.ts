@@ -138,11 +138,89 @@ export interface RenewalTask {
   lastAttemptAt?: Date;
   nextAttemptAt?: Date;
   completedAt?: Date;
-  failureHistory?: Array<{
+  lastSuccessAt?: Date;
+  lastIssuedSerial?: string;
+  consecutiveFailures: number;
+  lastIssuanceAt?: Date;
+  lastFailureSummary?: {
+    beforeSuccessCount: number;
+    lastError: string;
+    lastFailedAt: Date;
+    totalFailuresBeforeSuccess: number;
+  };
+  failureHistory: Array<{
     error: string;
     timestamp: Date;
     attempt: number;
   }>;
+  successHistory: Array<{
+    timestamp: Date;
+    serialNumber: string;
+    daysUntilExpiry: number;
+  }>;
+  currentPhase?: 'idle' | 'checking' | 'ordering' | 'challenging' | 'finalizing' | 'downloading' | 'installing' | 'cleaning';
+  phaseDetail?: string;
+}
+
+export type OperationType = 'initial-issue' | 'renewal' | 'manual-request' | 'force-renewal';
+
+export interface DomainOperationRecord {
+  type: OperationType;
+  startedAt: Date;
+  completedAt?: Date;
+  status: 'running' | 'success' | 'failed';
+  error?: string;
+  serialNumber?: string;
+  challengeType: ChallengeType;
+  phase?: RenewalTask['currentPhase'];
+}
+
+export interface DomainLifecycleStatus {
+  domain: string;
+  configuredDomains: string[];
+  effectiveChallengeType: ChallengeType;
+  hasWildcard: boolean;
+  autoRenewal: boolean;
+  lastOperation: {
+    type?: OperationType;
+    status?: 'running' | 'success' | 'failed';
+    startedAt?: Date;
+    completedAt?: Date;
+    error?: string;
+    serialNumber?: string;
+  };
+  lastSuccessfulIssue?: {
+    at: Date;
+    serialNumber: string;
+    expiresAt: Date;
+  };
+  lastRenewalAttempt?: {
+    at: Date;
+    success: boolean;
+    error?: string;
+  };
+  lastFailure?: {
+    at: Date;
+    error: string;
+    operationType?: OperationType;
+    phase?: RenewalTask['currentPhase'];
+  };
+  nextScheduledRenewalAt?: Date;
+  consecutiveRenewalFailures: number;
+  totalRenewalAttempts: number;
+  successfulRenewals: number;
+  currentState:
+    | 'unissued'
+    | 'issuing'
+    | 'issuing-failed'
+    | 'active'
+    | 'renewing'
+    | 'renewal-failed'
+    | 'expiring-soon'
+    | 'expired';
+  stateReason?: string;
+  latestOperations: DomainOperationRecord[];
+  renewalTask?: RenewalTask;
 }
 
 export interface CertificateRenewalStatus {
@@ -156,6 +234,52 @@ export interface CertificateRenewalStatus {
   needsRenewal: boolean;
   renewalTask?: RenewalTask;
   privateKeyEncrypted: boolean;
+}
+
+export interface HealthCheckResult {
+  healthy: boolean;
+  timestamp: Date;
+  uptimeMs: number;
+  components: {
+    manager: {
+      healthy: boolean;
+      initialized: boolean;
+      started: boolean;
+    };
+    httpChallenge: {
+      healthy: boolean;
+      port: number;
+      available: boolean;
+      detail?: string;
+    };
+    httpsDefaultCert: {
+      healthy: boolean;
+      port: number;
+      hasDefaultCert: boolean;
+      defaultDomain: string | null;
+      expiresAt?: Date;
+      daysUntilExpiry?: number;
+      detail?: string;
+    };
+    renewalScheduler: {
+      healthy: boolean;
+      isRunning: boolean;
+      anyConsecutiveFailures: boolean;
+      maxConsecutiveFailures: number;
+      failedDomains: string[];
+      detail?: string;
+    };
+    storage: {
+      healthy: boolean;
+      storageDir: string;
+      writable: boolean;
+      totalCertificates: number;
+      detail?: string;
+    };
+  };
+  summary: string[];
+  warnings: string[];
+  criticals: string[];
 }
 
 export interface ManagedServiceStatus {
@@ -191,12 +315,30 @@ export interface ManagedServiceStatus {
       activeConnections: number;
     };
   };
-  domains: Array<{
-    domain: string;
-    certificate: CertificateRenewalStatus | null;
-    challengeType: ChallengeType;
-    autoRenewal: boolean;
-  }>;
+  domains: DomainLifecycleStatus[];
+}
+
+export interface RenewalHistoryEntry {
+  domain: string;
+  timestamp: Date;
+  type: 'success' | 'failure';
+  attempt: number;
+  serialNumber?: string;
+  daysUntilExpiry?: number;
+  error?: string;
+}
+
+export interface DomainRenewalHistory {
+  domain: string;
+  entries: RenewalHistoryEntry[];
+  summary: {
+    totalSuccesses: number;
+    totalFailures: number;
+    consecutiveFailures: number;
+    lastSuccessAt?: Date;
+    lastFailureAt?: Date;
+    lastFailureError?: string;
+  };
 }
 
 export interface CertificateStorageConfig {

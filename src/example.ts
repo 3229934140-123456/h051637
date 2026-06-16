@@ -80,35 +80,44 @@ async function exampleUsage() {
   console.log('');
 
   console.log('[3/6] Status Monitoring API (getManagedStatus):');
-  console.log('  Provides comprehensive service status including:');
-  console.log('  • All managed certificates with expiry countdown');
-  console.log('  • Renewal task status, failure history, next retry time');
-  console.log('  • TLS handshake stats, active connections');
-  console.log('  • Per-domain configuration and auto-renewal status');
-  console.log('  • Private key encryption status per certificate');
+  console.log('  Provides comprehensive per-domain lifecycle status including:');
+  console.log('  • currentState: unissued | issuing | issuing-failed | active | renewing | renewal-failed | expiring-soon | expired');
+  console.log('  • lastOperation: type (initial-issue/renewal/force-renewal/manual-request), status, time, error');
+  console.log('  • lastSuccessfulIssue / lastRenewalAttempt / lastFailure with timestamps');
+  console.log('  • consecutiveRenewalFailures count and nextScheduledRenewalAt');
+  console.log('  • latestOperations[]: last 5 operations (per-domain) for debugging');
+  console.log('  • renewalTask with phase (checking/ordering/challenging/finalizing/installing/cleaning)');
+  console.log('  • Unissued domains show stateReason explaining WHERE it got stuck');
   console.log('');
 
-  console.log('[4/6] Persistent Renewal Tasks:');
-  console.log('  ✓ Renewal tasks saved to renewal-tasks.json');
-  console.log('  ✓ Failure history (last 10 errors) persisted across restarts');
-  console.log('  ✓ Next retry time saved - restarts resume from same schedule');
-  console.log('  ✓ Exponential backoff: retryDelay * 2^(attempt-1)');
-  console.log('  ✓ In-flight tasks marked failed after restart');
+  console.log('[4/6] Heatlh Check API (getHealthCheck):');
+  console.log('  Returns unified health with 5 components + warnings/criticals/summary:');
+  console.log('  • manager: initialized + started');
+  console.log('  • httpChallenge: port listening (probe HTTP-01 availability)');
+  console.log('  • httpsDefaultCert: default cert exists AND > minDaysRemaining (14 default)');
+  console.log('  • renewalScheduler: running + no domain exceeds consecutiveFailureThreshold (3 default)');
+  console.log('  • storage: directory writable + cert count');
+  console.log('  • top-level healthy = all 5 components healthy');
+  console.log('  • Easy to integrate with Prometheus / external probes');
   console.log('');
 
-  console.log('[5/6] Smooth Certificate Rotation:');
-  console.log('  ✓ New certificate SAVED FIRST before old one is removed');
-  console.log('  ✓ TLS context cache invalidated immediately after save');
-  console.log('  ✓ Old certificate only removed after new one is active');
-  console.log('  ✓ If renewal fails, old certificate remains untouched');
-  console.log('  ✓ Default domain auto-updated if it was using the old cert');
+  console.log('[5/6] Renewal History Query & Failure Preservation:');
+  console.log('  ✓ getRenewalHistory(domain, limit): per-domain success+failure timeline');
+  console.log('  ✓ getAllConsecutiveFailures(): global overview of problematic domains');
+  console.log('  ✓ Success does NOT erase failureHistory — lastFailureSummary preserved:');
+  console.log('      - beforeSuccessCount: consecutive failures before this success');
+  console.log('      - lastError / lastFailedAt: last error before success saved');
+  console.log('      - totalFailuresBeforeSuccess: total in run-up to success');
+  console.log('  ✓ successHistory: last 20 successful renewals (serial + days remaining)');
+  console.log('  ✓ Everything persisted in renewal-tasks.json (v2 format)');
   console.log('');
 
-  console.log('[6/6] Challenge Cleanup Guarantees:');
-  console.log('  ✓ HTTP tokens cleaned on BOTH success AND failure');
-  console.log('  ✓ DNS TXT records removed on BOTH success AND failure');
-  console.log('  ✓ Partial failures (e.g., one domain fails in SAN) still cleanup');
-  console.log('  ✓ Each cleanup operation wrapped in try/catch to not mask original error');
+  console.log('[6/6] Comprehensive Hot-Switch Coverage:');
+  console.log('  ✓ invalidateContextCacheForDomains(domains[]): invalidates ALL SAN entries');
+  console.log('  ✓ Wildcard expansion: deleting *.example.com also deletes sub.example.com cache');
+  console.log('  ✓ Reverse wildcard: deleting sub.example.com also deletes *.example.com cache');
+  console.log('  ✓ Old cert removed only AFTER new cert saved + cache invalidated');
+  console.log('  ✓ Default domain auto-switched if old cert was the default');
   console.log('');
 
   console.log('========================================');
@@ -189,17 +198,34 @@ async function exampleUsage() {
   console.log('  });\n');
 
   console.log('Get service status for monitoring:');
-  console.log('  const status = await manager.getManagedStatus();');
-  console.log('  console.log(JSON.stringify(status, null, 2));\n');
+  console.log('  const managed = await manager.getManagedStatus();');
+  console.log('  for (const d of managed.domains) {');
+  console.log('    console.log(`${d.domain}: state=${d.currentState}, reason=${d.stateReason}`);');
+  console.log('    console.log(`  last op: ${d.lastOperation.type} ${d.lastOperation.status}`);');
+  console.log('    if (d.lastFailure) console.log(`  last failure: ${d.lastFailure.error} at ${d.lastFailure.at}`);');
+  console.log('  }\n');
 
-  console.log('Status output includes:');
-  console.log('  - certificates[].daysUntilExpiry');
-  console.log('  - certificates[].needsRenewal');
-  console.log('  - certificates[].renewalTask.lastError');
-  console.log('  - certificates[].renewalTask.nextAttemptAt');
-  console.log('  - certificates[].renewalTask.failureHistory[]');
-  console.log('  - renewalScheduler.tasks[] with full history');
-  console.log('  - tls.stats with handshake counters\n');
+  console.log('Health check for Prometheus/external probes:');
+  console.log('  const hc = await manager.getHealthCheck({');
+  console.log('    consecutiveFailureThreshold: 3,   // >=3 consecutive failures = critical');
+  console.log('    minDaysRemaining: 14,            // <14 days default cert = warning');
+  console.log('  });');
+  console.log('  // hc.healthy = boolean for quick check');
+  console.log('  // hc.criticals[] / warnings[] / summary[] for alert messages\n');
+
+  console.log('Per-domain renewal history for debugging:');
+  console.log('  const hist = manager.getRenewalHistory("example.com", 10);');
+  console.log('  console.log(`Total successes=${hist.summary.totalSuccesses}, failures=${hist.summary.totalFailures}`);');
+  console.log('  console.log(`Consecutive failures now=${hist.summary.consecutiveFailures}`);');
+  console.log('  for (const e of hist.entries) {');
+  console.log('    console.log(`  ${e.timestamp} ${e.type} ${e.serialNumber || e.error}`);');
+  console.log('  }\n');
+
+  console.log('List domains with >=2 consecutive renewal failures:');
+  console.log('  const bad = manager.getAllConsecutiveFailures();');
+  console.log('  for (const b of bad) {');
+  console.log('    console.log(`${b.domain}: ${b.consecutiveFailures}x failed, next=${b.nextAttemptAt}`);');
+  console.log('  }\n');
 
   console.log('[Cleanup] This is a demo - not starting servers in example mode.');
   console.log('In production, call: await manager.start(handler)');
