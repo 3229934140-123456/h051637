@@ -1,0 +1,589 @@
+import * as https from 'https';
+import * as http from 'http';
+import * as tls from 'tls';
+import * as net from 'net';
+import * as crypto from 'crypto';
+import { CertificateStore } from './certificate-store';
+import { TLSTerminationConfig, StoredCertificate } from './types';
+
+export type RequestHandler = (
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+) => void;
+
+export interface TlsSessionInfo {
+  sni: string | undefined;
+  protocol: string;
+  cipher: string;
+  clientCertSubject?: string;
+  sessionId?: string;
+}
+
+export interface TlsTerminationStats {
+  totalTlsHandshakes: number;
+  successfulHandshakes: number;
+  failedHandshakes: number;
+  sniMatches: number;
+  sniFallbackCount: number;
+  sniMismatchCount: number;
+  cachedContextHits: number;
+  cachedContextMisses: number;
+  httpRequestsForwarded: number;
+  httpsRequestsForwarded: number;
+  httpRedirects: number;
+  activeConnections: number;
+}
+
+export class TLSTermination {
+  private config: Required<TLSTerminationConfig>;
+  private certStore: CertificateStore;
+  private requestHandler: RequestHandler | null = null;
+  private httpsServer: https.Server | null = null;
+  private httpServer: http.Server | null = null;
+  private defaultContext: tls.SecureContext | null = null;
+  private contextCache: Map<string, tls.SecureContext> = new Map();
+  private contextCacheTtl: number = 10 * 60 * 1000;
+  private contextCacheMeta: Map<string, number> = new Map();
+  private defaultDomain: string | null = null;
+  private stats: TlsTerminationStats = {
+    totalTlsHandshakes: 0,
+    successfulHandshakes: 0,
+    failedHandshakes: 0,
+    sniMatches: 0,
+    sniFallbackCount: 0,
+    sniMismatchCount: 0,
+    cachedContextHits: 0,
+    cachedContextMisses: 0,
+    httpRequestsForwarded: 0,
+    httpsRequestsForwarded: 0,
+    httpRedirects: 0,
+    activeConnections: 0,
+  };
+  private activeConnections: Set<net.Socket> = new Set();
+  private certCacheWatcherInterval: NodeJS.Timeout | null = null;
+
+  constructor(
+    certStore: CertificateStore,
+    config: Partial<TLSTerminationConfig>
+  ) {
+    this.certStore = certStore;
+    this.config = {
+      httpPort: config.httpPort ?? 80,
+      httpsPort: config.httpsPort ?? 443,
+      defaultDomain: config.defaultDomain ?? '',
+      challengePort: config.challengePort ?? 80,
+    };
+    this.defaultDomain = config.defaultDomain ?? null;
+  }
+
+  setRequestHandler(handler: RequestHandler): void {
+    this.requestHandler = handler;
+  }
+
+  async start(): Promise<void> {
+    await this.buildDefaultContext();
+
+    await new Promise<void>((resolve, reject) => {
+      this.httpsServer = https.createServer({
+        SNICallback: (servername, cb) => this.sniCallback(servername, cb),
+        key: undefined as any,
+        cert: undefined as any,
+      });
+
+      this.httpsServer.on('tlsClientError', (err, socket) => {
+        this.stats.failedHandshakes++;
+        this.stats.totalTlsHandshakes++;
+        const sni = (socket as any).servername || 'unknown';
+        console.warn(
+          `[TLSTermination] TLS handshake error for SNI=${sni}: ${err.message}`
+        );
+      });
+
+      this.httpsServer.on('secureConnection', (socket: tls.TLSSocket) => {
+        this.stats.successfulHandshakes++;
+        this.stats.totalTlsHandshakes++;
+        this.stats.activeConnections++;
+        this.activeConnections.add(socket);
+
+        socket.on('close', () => {
+          this.stats.activeConnections--;
+          this.activeConnections.delete(socket);
+        });
+
+        const sessionInfo = this.getSessionInfo(socket);
+        if (sessionInfo.sni) {
+          console.debug(
+            `[TLSTermination] TLS session: SNI=${sessionInfo.sni}, protocol=${sessionInfo.protocol}, cipher=${sessionInfo.cipher}`
+          );
+        }
+      });
+
+      this.httpsServer.on('request', (req, res) => {
+        this.stats.httpsRequestsForwarded++;
+        this.handleRequest(req, res, true);
+      });
+
+      this.httpsServer.on('error', (err) => {
+        reject(err);
+      });
+
+      this.httpsServer.listen(this.config.httpsPort, () => {
+        console.log(
+          `[TLSTermination] HTTPS server listening on port ${this.config.httpsPort}`
+        );
+        resolve();
+      });
+    });
+
+    if (this.config.httpPort !== this.config.challengePort) {
+      await this.startHttpRedirectServer();
+    } else {
+      await this.startHttpServerWithChallenges();
+    }
+
+    this.startCertCacheWatcher();
+  }
+
+  private async startHttpRedirectServer(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.httpServer = http.createServer((req, res) => {
+        const host = req.headers['host'] || this.defaultDomain || 'localhost';
+        const targetHost = (host as string).replace(/:\d+$/, '');
+        const targetPort =
+          this.config.httpsPort === 443 ? '' : `:${this.config.httpsPort}`;
+        const redirectUrl = `https://${targetHost}${targetPort}${req.url}`;
+
+        this.stats.httpRedirects++;
+        console.debug(
+          `[TLSTermination] HTTP->HTTPS redirect: ${req.url} -> ${redirectUrl}`
+        );
+
+        res.writeHead(301, {
+          Location: redirectUrl,
+          'Cache-Control': 'max-age=3600',
+          'Strict-Transport-Security':
+            'max-age=31536000; includeSubDomains; preload',
+        });
+        res.end('Moved Permanently');
+      });
+
+      this.httpServer.on('error', (err) => {
+        reject(err);
+      });
+
+      this.httpServer.listen(this.config.httpPort, () => {
+        console.log(
+          `[TLSTermination] HTTP redirect server listening on port ${this.config.httpPort}`
+        );
+        resolve();
+      });
+    });
+  }
+
+  private async startHttpServerWithChallenges(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.httpServer = http.createServer((req, res) => {
+        const url = req.url || '/';
+
+        if (url.startsWith('/.well-known/acme-challenge/')) {
+          this.stats.httpRequestsForwarded++;
+          this.handleRequest(req, res, false);
+          return;
+        }
+
+        const host = req.headers['host'] || this.defaultDomain || 'localhost';
+        const targetHost = (host as string).replace(/:\d+$/, '');
+        const targetPort =
+          this.config.httpsPort === 443 ? '' : `:${this.config.httpsPort}`;
+        const redirectUrl = `https://${targetHost}${targetPort}${req.url}`;
+
+        this.stats.httpRedirects++;
+
+        res.writeHead(301, {
+          Location: redirectUrl,
+          'Cache-Control': 'max-age=3600',
+          'Strict-Transport-Security':
+            'max-age=31536000; includeSubDomains; preload',
+        });
+        res.end('Moved Permanently');
+      });
+
+      this.httpServer.on('error', (err) => {
+        reject(err);
+      });
+
+      this.httpServer.listen(this.config.httpPort, () => {
+        console.log(
+          `[TLSTermination] HTTP server (challenges + redirect) listening on port ${this.config.httpPort}`
+        );
+        resolve();
+      });
+    });
+  }
+
+  private async buildDefaultContext(): Promise<void> {
+    if (this.defaultDomain) {
+      const tlsContext = await this.certStore.getTlsContextForDomain(
+        this.defaultDomain
+      );
+      if (tlsContext) {
+        this.defaultContext = tls.createSecureContext({
+          key: tlsContext.key,
+          cert: tlsContext.cert,
+          ca: tlsContext.ca,
+          minVersion: 'TLSv1.2',
+          ciphers: this.getRecommendedCiphers(),
+          honorCipherOrder: true,
+        });
+        console.log(
+          `[TLSTermination] Default TLS context built for domain: ${this.defaultDomain}`
+        );
+        return;
+      }
+    }
+
+    const managedDomains = this.certStore.getManagedDomains();
+    if (managedDomains.length > 0) {
+      const tlsContext = await this.certStore.getTlsContextForDomain(
+        managedDomains[0]
+      );
+      if (tlsContext) {
+        this.defaultContext = tls.createSecureContext({
+          key: tlsContext.key,
+          cert: tlsContext.cert,
+          ca: tlsContext.ca,
+          minVersion: 'TLSv1.2',
+          ciphers: this.getRecommendedCiphers(),
+          honorCipherOrder: true,
+        });
+        this.defaultDomain = managedDomains[0];
+        console.log(
+          `[TLSTermination] Default TLS context fallback to: ${managedDomains[0]}`
+        );
+        return;
+      }
+    }
+
+    console.warn(
+      '[TLSTermination] No certificates available for default TLS context. Generating self-signed fallback.'
+    );
+    this.defaultContext = this.createSelfSignedContext('localhost');
+  }
+
+  private createSelfSignedContext(domain: string): tls.SecureContext {
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+    });
+
+    const forge = require('node-forge');
+    const pk = forge.pki.privateKeyFromPem(privateKey);
+    const cert = forge.pki.createCertificate();
+
+    cert.publicKey = forge.pki.publicKeyFromPem(publicKey);
+    cert.serialNumber = '01';
+    cert.validity.notBefore = new Date();
+    cert.validity.notAfter = new Date();
+    cert.validity.notAfter.setFullYear(
+      cert.validity.notBefore.getFullYear() + 1
+    );
+
+    const attrs = [
+      { name: 'commonName', value: domain },
+      { name: 'countryName', value: 'US' },
+      { name: 'organizationName', value: 'Fallback' },
+    ];
+    cert.setSubject(attrs);
+    cert.setIssuer(attrs);
+    cert.setExtensions([
+      { name: 'basicConstraints', cA: true },
+      {
+        name: 'subjectAltName',
+        altNames: [
+          { type: 2, value: domain },
+          { type: 2, value: 'localhost' },
+          { type: 7, ip: '127.0.0.1' },
+        ],
+      },
+    ]);
+    cert.sign(pk, forge.md.sha256.create());
+
+    const certPem = forge.pki.certificateToPem(cert);
+
+    return tls.createSecureContext({
+      key: privateKey,
+      cert: certPem,
+      minVersion: 'TLSv1.2',
+      ciphers: this.getRecommendedCiphers(),
+    });
+  }
+
+  private getRecommendedCiphers(): string {
+    return [
+      'ECDHE-ECDSA-AES256-GCM-SHA384',
+      'ECDHE-RSA-AES256-GCM-SHA384',
+      'ECDHE-ECDSA-CHACHA20-POLY1305',
+      'ECDHE-RSA-CHACHA20-POLY1305',
+      'ECDHE-ECDSA-AES128-GCM-SHA256',
+      'ECDHE-RSA-AES128-GCM-SHA256',
+    ].join(':');
+  }
+
+  private async sniCallback(
+    servername: string,
+    cb: (err: Error | null, ctx?: tls.SecureContext) => void
+  ): Promise<void> {
+    try {
+      const normalizedServername = servername.toLowerCase();
+
+      const cached = this.getContextFromCache(normalizedServername);
+      if (cached) {
+        this.stats.cachedContextHits++;
+        cb(null, cached);
+        return;
+      }
+
+      this.stats.cachedContextMisses++;
+
+      let tlsContext = await this.certStore.getTlsContextForDomain(
+        normalizedServername
+      );
+
+      if (!tlsContext) {
+        tlsContext = await this.findWildcardMatch(normalizedServername);
+      }
+
+      if (tlsContext) {
+        this.stats.sniMatches++;
+        const secureContext = tls.createSecureContext({
+          key: tlsContext.key,
+          cert: tlsContext.cert,
+          ca: tlsContext.ca,
+          minVersion: 'TLSv1.2',
+          ciphers: this.getRecommendedCiphers(),
+          honorCipherOrder: true,
+        });
+
+        this.putContextInCache(normalizedServername, secureContext);
+        cb(null, secureContext);
+      } else {
+        this.stats.sniFallbackCount++;
+        console.warn(
+          `[TLSTermination] No certificate found for SNI=${servername}, using default`
+        );
+        cb(null, this.defaultContext || undefined);
+      }
+    } catch (err) {
+      this.stats.sniMismatchCount++;
+      console.error(
+        `[TLSTermination] SNI callback error for ${servername}: ${(err as Error).message}`
+      );
+      cb(null, this.defaultContext || undefined);
+    }
+  }
+
+  private async findWildcardMatch(
+    domain: string
+  ): Promise<{ cert: string; key: string; ca?: string } | null> {
+    const parts = domain.split('.');
+    if (parts.length < 2) {
+      return null;
+    }
+
+    const wildcardDomain = `*.${parts.slice(1).join('.')}`;
+    return this.certStore.getTlsContextForDomain(wildcardDomain);
+  }
+
+  private getContextFromCache(servername: string): tls.SecureContext | null {
+    const now = Date.now();
+    const cachedAt = this.contextCacheMeta.get(servername);
+
+    if (!cachedAt) {
+      return null;
+    }
+
+    if (now - cachedAt > this.contextCacheTtl) {
+      this.contextCache.delete(servername);
+      this.contextCacheMeta.delete(servername);
+      return null;
+    }
+
+    return this.contextCache.get(servername) || null;
+  }
+
+  private putContextInCache(
+    servername: string,
+    context: tls.SecureContext
+  ): void {
+    this.contextCache.set(servername, context);
+    this.contextCacheMeta.set(servername, Date.now());
+  }
+
+  invalidateContextCache(domain?: string): void {
+    if (domain) {
+      this.contextCache.delete(domain.toLowerCase());
+      this.contextCacheMeta.delete(domain.toLowerCase());
+      console.log(
+        `[TLSTermination] Invalidated TLS context cache for ${domain}`
+      );
+    } else {
+      this.contextCache.clear();
+      this.contextCacheMeta.clear();
+      this.buildDefaultContext().catch((err) => {
+        console.error(
+          `[TLSTermination] Failed to rebuild default context: ${err.message}`
+        );
+      });
+      console.log('[TLSTermination] Invalidated entire TLS context cache');
+    }
+  }
+
+  private startCertCacheWatcher(): void {
+    this.certCacheWatcherInterval = setInterval(() => {
+      this.invalidateContextCache();
+    }, 60 * 60 * 1000);
+  }
+
+  private handleRequest(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    isHttps: boolean
+  ): void {
+    if (isHttps) {
+      (req as any).isSecure = true;
+      const socket = req.socket as tls.TLSSocket;
+      const sessionInfo = this.getSessionInfo(socket);
+      (req as any).tlsSession = sessionInfo;
+    } else {
+      (req as any).isSecure = false;
+    }
+
+    if (this.requestHandler) {
+      try {
+        this.requestHandler(req, res);
+      } catch (err) {
+        console.error(
+          `[TLSTermination] Request handler error: ${(err as Error).message}`
+        );
+        if (!res.headersSent) {
+          res.statusCode = 500;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(
+            JSON.stringify({ error: 'Internal Server Error', code: 500 })
+          );
+        }
+      }
+    } else {
+      res.statusCode = 502;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(
+        JSON.stringify({
+          error: 'No upstream handler configured',
+          code: 502,
+        })
+      );
+    }
+  }
+
+  private getSessionInfo(socket: tls.TLSSocket): TlsSessionInfo {
+    const cipher = socket.getCipher();
+    const protocol = socket.getProtocol?.() || 'TLS';
+    const session = socket.getSession?.();
+    const peerCert = socket.getPeerCertificate?.(true);
+
+    const servername = socket.servername;
+    const sniVal: string | undefined = typeof servername === 'string'
+      ? servername
+      : undefined;
+
+    let clientCertSubject: string | undefined;
+    const cnField = peerCert?.subject?.CN;
+    if (Array.isArray(cnField)) {
+      clientCertSubject = cnField[0];
+    } else if (typeof cnField === 'string') {
+      clientCertSubject = cnField;
+    }
+
+    return {
+      sni: sniVal,
+      protocol,
+      cipher: cipher ? cipher.name : 'unknown',
+      clientCertSubject,
+      sessionId: session
+        ? session.slice(0, 32).toString('hex')
+        : undefined,
+    };
+  }
+
+  async stop(): Promise<void> {
+    if (this.certCacheWatcherInterval) {
+      clearInterval(this.certCacheWatcherInterval);
+      this.certCacheWatcherInterval = null;
+    }
+
+    if (this.httpsServer) {
+      await new Promise<void>((resolve) => {
+        this.httpsServer!.close(() => {
+          console.log('[TLSTermination] HTTPS server stopped');
+          resolve();
+        });
+      });
+      this.httpsServer = null;
+    }
+
+    if (this.httpServer) {
+      await new Promise<void>((resolve) => {
+        this.httpServer!.close(() => {
+          console.log('[TLSTermination] HTTP server stopped');
+          resolve();
+        });
+      });
+      this.httpServer = null;
+    }
+
+    for (const socket of this.activeConnections) {
+      socket.destroy();
+    }
+    this.activeConnections.clear();
+  }
+
+  getStats(): TlsTerminationStats {
+    return { ...this.stats, activeConnections: this.activeConnections.size };
+  }
+
+  async getCertificatesStatus(): Promise<
+    Array<{
+      domain: string;
+      serialNumber: string;
+      expiresAt: Date;
+      daysUntilExpiry: number;
+      hasContext: boolean;
+    }>
+  > {
+    const certs = await this.certStore.getAllCertificates();
+    const now = new Date();
+
+    return certs.map((cert: StoredCertificate) => {
+      const daysUntilExpiry = Math.ceil(
+        (cert.expiresAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000)
+      );
+      return {
+        domain: cert.domain,
+        serialNumber: cert.serialNumber,
+        expiresAt: cert.expiresAt,
+        daysUntilExpiry,
+        hasContext: this.contextCache.has(cert.domain.toLowerCase()),
+      };
+    });
+  }
+
+  setDefaultDomain(domain: string): void {
+    this.defaultDomain = domain;
+    this.buildDefaultContext().catch((err) => {
+      console.error(
+        `[TLSTermination] Failed to set default domain ${domain}: ${err.message}`
+      );
+    });
+  }
+}
